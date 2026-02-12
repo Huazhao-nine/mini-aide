@@ -197,7 +197,7 @@ class Agent:
     def _env_prompt(self):
         return (
             "运行环境说明：你可以使用常见的 Python 数据科学库，如 numpy, pandas, scikit-learn, "
-            "torch, xgboost, lightgbm。数据文件位于 './input' 目录。"
+            "torch, xgboost, lightgbm。数据文件位于 './input' 目录。也可以使用GPU加速。"
             f"代码执行超时时间为 {humanize.naturaldelta(self.timeout)}。"
         )
 
@@ -214,7 +214,7 @@ class Agent:
         user_msg = (
             f"任务描述：\n{task_desc}\n\n"
             f"{self._env_prompt}\n"
-            "要求：单文件脚本，必须打印 'Score: <value>'。"
+            "要求：单文件脚本。"
         )
         self._log_prompt("DRAFT", user_msg)
         return self._query_llm(sys_msg, user_msg)
@@ -234,6 +234,7 @@ class Agent:
         sys_msg = "你是一位 Python 调试专家。请修复代码中的 Bug。"
         user_msg = (
             f"任务：{task_desc}\n\n"
+            f"错误代码：\n```python\n{parent_node.code}\n```\n"
             f"错误日志：\n{parent_node.error}\n\n" 
             "请分析原因并提供修复后的代码。"
         )
@@ -254,28 +255,55 @@ class Agent:
     # ⚖️ Reviewer
     # ==========================================
     def _review_execution(self, task, code, result) -> Dict[str, Any]:
+        # 1. 解释器层面的硬错误 (SyntaxError, Timeout 等)
         if not result.success:
              return {
                 "is_bug": True,
                 "score": 0.0,
-                "summary": f"系统级错误: {result.error[:100]}..."
+                "summary": f"系统执行错误: {result.error.strip()[:200]}..."
             }
 
+        # 2. LLM 语义层面的审查
         prompt = f"""
-        你是一位 AI 裁判。评估代码运行结果，如果代码可以正常运行，is_bug=False，反之is_bug=True。
-        Task: {task}...
-        Output:{result.output}
-        Output JSON: {{"is_bug": bool, "score": float, "summary": str}}
+        你是一位严格的 AI 代码裁判。请分析下面的代码执行日志。
+        
+        【任务目标】: {task}...
+        
+        【代码执行输出 (Stdout/Stderr)】:
+        {result.output}
+        
+        【裁判任务】:
+        1. **提取分数**: 寻找输出中类似 'Score: 0.1234' 或 'RMSE: ...' 的行。
+        2. **判定 Bug**: 
+           - 如果出现 'Traceback', 'Error', 'Exception'，则 is_bug=True。
+           - 如果 Score 为 0.0, NaN, Inf，或者没有找到 Score，则 is_bug=True (视为逻辑失败)。
+           - 否则 is_bug=False。
+        3. **总结**: 用一句话简述运行结果（例如："模型训练成功，验证集分数 0.55" 或 "特征工程阶段出现 KeyError"）。
+
+        【输出格式 (仅 JSON)】:
+        {{
+            "is_bug": boolean,
+            "score": float,
+            "summary": "string"
+        }}
         """
         
         try:
+            # 温度设为 0，保证绝对理性
             content, _ = generate_response([{"role": "user", "content": prompt}], temperature=0)
+            
+            # 清洗 markdown 标记
             json_str = content.replace("```json", "").replace("```", "").strip()
+            # 有时候模型会输出 'Output: {...}'，尝试找到第一个 { 和最后一个 }
+            if "{" in json_str:
+                json_str = json_str[json_str.find("{"):json_str.rfind("}")+1]
+                
             data = json.loads(json_str)
             return data
         except Exception as e:
-            print(f"{Colors.RED}⚠️ Review 解析失败: {e}{Colors.ENDC}")
-            return {"is_bug": True, "score": 0.0, "summary": "Reviewer JSON Error"}
+            print(f"{Colors.RED}⚠️ Review 解析失败: {e} | Raw: {content[:100]}...{Colors.ENDC}")
+            # 兜底策略：如果 LLM 读不懂日志，多半是日志乱码或为空，判负
+            return {"is_bug": True, "score": 0.0, "summary": "Reviewer JSON Parse Error"}
 
     def _update_node_with_result(self, node, result, review_data):
         node.output = result.output

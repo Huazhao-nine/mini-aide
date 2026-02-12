@@ -107,17 +107,35 @@ class Journal:
             curr = curr.parent
         path.reverse()
         
-        context_str = "--- Previous History ---\n"
+        context_str = "--- Previous History Trace ---\n"
+        
+        # 只保留最近的 3 个节点显示完整代码，更早的节点只显示摘要
+        # 这样跑 20 步也不会爆 Context
+        full_context_limit = 3 
+        
         for i, n in enumerate(path):
+            is_recent = (i >= len(path) - full_context_limit)
+            
             context_str += f"Step {i+1} [{n.stage}]:\n"
-            context_str += f"Code Snippet: {n.code[:100]}...\n"
-            if not n.success:
-                context_str += f"Error: {n.error[:300]}... (truncated)\n"
+            
+            if is_recent:
+                # 最近的节点：显示较多代码和报错
+                context_str += f"Code Snippet:\n```python\n{n.code} ...\n```\n" 
+                if not n.success:
+                    context_str += f"Error:\n{n.error}...\n"
+                else:
+                    context_str += f"Output Score: {n.score}\n"
+                    if n.analysis: context_str += f"Review: {n.analysis}\n"
             else:
-                context_str += f"Output Score: {n.score}\n"
-                if n.analysis:
-                    context_str += f"Review: {n.analysis}\n"
+                # 远古节点：只显示极简摘要 (为了节省 Token)
+                context_str += f"(Old Step) Code Length: {len(n.code)} chars\n"
+                if not n.success:
+                    context_str += "Status: FAILED (Error truncated)\n"
+                else:
+                    context_str += f"Status: SUCCESS | Score: {n.score}\n"
+                    
             context_str += "------------------------\n"
+            
         return context_str
 
     def _extract_score(self, text: str) -> float:
