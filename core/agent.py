@@ -127,66 +127,63 @@ class Agent:
 
 
     # ==========================================
-    # 🧠 Search Policy (升级版：模拟退火 Softmax)
+    # 🧠 Search Policy (修正版：加入分数放大机制)
     # ==========================================
     def _search_policy(self) -> Optional[Node]:
-        # 1. [Draft] 数量不足先起草 (最高优先级)
-        # ------------------------------------------------
+        # 1. [Draft] 数量不足先起草
         draft_nodes = [n for n in self.journal.nodes if n.stage == "draft"]
         if len(draft_nodes) < self.search_cfg["num_drafts"]:
             return None
 
         # 2. [Debug] 随机给错误节点修复机会
-        # ------------------------------------------------
         buggy_leaves = [
-            n for n in self.journal.nodes   
+            n for n in self.journal.nodes 
             if n.is_buggy and len(n.children) == 0 
         ]
-        # 动态 Debug 概率：步数越少越爱修 Bug，步数多了就不修了，专心冲刺
         current_step = len(self.journal.nodes)
         progress = current_step / self.max_steps
         
-        # Debug 概率从配置值衰减到 0.1
-        dynamic_debug_prob = self.search_cfg["debug_prob"] * (1 - progress * 0.8)
+        # 让 Debug 概率衰减得更快一点，把机会留给 Improve
+        dynamic_debug_prob = self.search_cfg["debug_prob"] * (1 - progress) 
         
         if buggy_leaves and random.random() < dynamic_debug_prob:
             return random.choice(buggy_leaves)
 
         # 3. [Improve] 模拟退火 Softmax 采样
-        # ------------------------------------------------
-        # 筛选候选：成功的 + 未枯竭的(<3个孩子)
         candidates = [
             n for n in self.journal.nodes 
             if n.success and len(n.children) < 3
         ]
 
         if not candidates:
-            # 兜底：如果没有符合条件的，退化为贪心，选全场最佳
             return self.journal.get_best_node()
 
-        # --- 核心算法：带温度的 Softmax ---
+        # --- 核心算法：带放大系数的 Softmax ---
         
-        # A. 获取分数向量
+        # A. 获取分数
         scores = np.array([n.score for n in candidates])
         
-        # B. 计算动态温度 T (Simulated Annealing)
-        # T 从 2.0 (高温, 接近均匀分布) 线性降低到 0.1 (低温, 接近 argmax)
-        # progress: 0.0 -> 1.0
-        T = 2.0 * (1 - progress) + 0.1
+        # B. 计算温度 T (从 1.5 降到 0.1，稍微降低初始温度，减少前期无脑乱撞)
+        T = 1.5 * (1 - progress) + 0.1
         
-        # C. 计算 Softmax 概率
-        # 公式: P(x) = exp(score / T) / sum(...)
-        # 技巧: score 先减去最大值防止 exp 溢出，数值更稳定
-        # 注意: 这里的 score 必须是正数且越大越好
-        exp_scores = np.exp((scores - np.max(scores)) / T)
+        # C. 【关键修改】分数放大系数 (Scaling Factor)
+        # 因为 Score 都在 0~1 之间，直接 Softmax 差异太小。
+        # 放大 10 倍，让 0.5 和 0.1 的差距在指数上体现出来。
+        scale_factor = 10.0 
+        scaled_scores = scores * scale_factor
+        
+        # D. 计算概率
+        # 先减去最大值防止溢出 (数值稳定性标准操作)
+        exp_scores = np.exp((scaled_scores - np.max(scaled_scores)) / T)
         probs = exp_scores / np.sum(exp_scores)
         
-        # D. 根据概率采样
+        # E. 采样
         selected_node = np.random.choice(candidates, p=probs)
         
-        # (可选) 打印调试信息，让你在控制台看到 Agent 的"思考"
+        # 打印调试信息，让你看清楚它到底有多大概率选最好的
         best_idx = np.argmax(scores)
-        print(f"🌡️ [退火] Step {current_step}/{self.max_steps} | Temp={T:.2f} | 最佳节点概率={probs[best_idx]:.2f}")
+        print(f"🌡️ [退火] Step {current_step}/{self.max_steps} | Temp={T:.2f} | 放大系数={scale_factor}")
+        print(f"   👉 最佳节点(Score {scores[best_idx]:.4f}) 被选中概率: {probs[best_idx]:.2%}")
         
         return selected_node
 
