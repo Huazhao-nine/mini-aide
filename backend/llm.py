@@ -3,74 +3,65 @@ import os
 from openai import OpenAI
 
 # ==========================================
-# 1. 配置 DeepSeek API
+# 配置 DeepSeek API
 # ==========================================
-# 你的 API Key
 API_KEY = "sk-d66b659120d04f3eb60b79cd88b7b62a"
 BASE_URL = "https://api.deepseek.com"
 
-# 初始化客户端
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-
-# ==========================================
-# 2. 核心生成函数 (流式)
-# ==========================================
 
 def generate_response(messages, temperature=0):
     """
     通用生成接口 (Streaming 版) - 适配 DeepSeek R1 API
-    
-    :param messages: 标准 OpenAI 格式 [{"role": "user", "content": "..."}]
-    :return: (content_str, thought_str)
+    功能：仅负责流式接收并拼接字符串，不处理任何业务逻辑。
+    返回：(full_content, full_reasoning)
     """
     print(f"🤖 [AI] Connecting to DeepSeek API (Temp: {temperature})...\n")
     print("-" * 50) 
     
     try:
-        # 使用 deepseek-reasoner 模型 (即 R1)
         response = client.chat.completions.create(
             model="deepseek-reasoner", 
             messages=messages,
-            stream=True,
-            temperature=temperature
+            stream=True
         )
         
         full_content = ""
         full_reasoning = ""
-        is_thinking = True # 标记当前是否在思考阶段
-
-        # 打印思考开始标记
+        is_thinking = True 
+        
         sys.stdout.write("💭 [Thinking] \n")
         
         for chunk in response:
-            # 1. 处理思维链 (Reasoning Content)
-            # DeepSeek API 会先返回 reasoning_content，再返回 content
+            # 1. 收集思维链 (Reasoning) - 仅 DeepSeek R1 有效
             if hasattr(chunk.choices[0].delta, 'reasoning_content'):
                 reasoning = chunk.choices[0].delta.reasoning_content
                 if reasoning:
-                    sys.stdout.write(reasoning)
-                    sys.stdout.flush()
+                    # sys.stdout.write(reasoning)
+                    # sys.stdout.flush()
                     full_reasoning += reasoning
             
-            # 2. 处理正文 (Content)
+            # 2. 收集正文 (Content)
             if hasattr(chunk.choices[0].delta, 'content'):
                 content = chunk.choices[0].delta.content
                 if content:
-                    # 如果是从思考转到正文，打印一个分割线
-                    if is_thinking:
+                    # UI 交互：从思考切换到正文时打印分割线
+                    if is_thinking and full_reasoning:
                         sys.stdout.write("\n\n💡 [Answer] \n")
                         is_thinking = False
-                    
+                    elif is_thinking and not full_reasoning:
+                         # 如果没有思维链直接输出内容（兼容 V3）
+                        sys.stdout.write("\n💡 [Answer] \n")
+                        is_thinking = False
+
                     sys.stdout.write(content)
                     sys.stdout.flush()
                     full_content += content
 
         print("\n" + "-" * 50 + "\n")
         
-        # API 已经帮我们分好了，不需要再正则提取 <think> 标签了
         return full_content, full_reasoning
 
     except Exception as e:
         print(f"\n❌ [API Error] {str(e)}")
-        # 返回空字符串防止程序崩溃
         return "", ""

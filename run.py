@@ -51,27 +51,61 @@ COVID_DATA_DESC = """
 """
 
 def get_data_summary(df: pd.DataFrame, name: str) -> str:
-    """生成数据的详细统计摘要"""
+    """生成数据的详细统计摘要（针对 COVID 数据集优化）"""
     buffer = io.StringIO()
     buffer.write(f"--- Data Summary for {name} ---\n")
     buffer.write(f"Shape: {df.shape}\n")
     
+    # 1. 列信息 (显示所有列，让 Agent 知道 State 的 One-Hot 编码存在)
     buffer.write("\n[Columns Info]\n")
-    # 获取列名和类型
-    df.info(buf=buffer, verbose=True, show_counts=True)
+    # 如果列数过多 (>60)，只显示简略信息；否则显示完整列表
+    if len(df.columns) > 60:
+        buffer.write(f"Total Columns: {len(df.columns)}\n")
+        buffer.write("Dtypes:\n")
+        buffer.write(df.dtypes.value_counts().to_string())
+        buffer.write("\n\n(Too many columns to list all details. See Sample Data below.)\n")
+    else:
+        df.info(buf=buffer, verbose=True, show_counts=True)
     
+    # 2. 数据样例 (查看实际数值格式)
     buffer.write("\n[First 3 Rows]\n")
     try:
         buffer.write(df.head(3).to_markdown(index=False, numalign="left", stralign="left"))
     except ImportError:
         buffer.write(df.head(3).to_string(index=False))
     
-    # 只需要显示部分关键特征的分布，避免Prompt过长
+    # 3. 关键特征统计 (核心修改)
     buffer.write("\n\n[Key Features Statistics]\n")
-    key_cols = ['cli', 'ili', 'wearing_mask_7d', 'tested_positive']
+    
+    # 覆盖 PPT 中提到的各类特征代表，以及可能的 Target 名称
+    potential_targets = ['tested_positive_day3']
+    
+    feature_groups = [
+        # 症状 (Illness)
+        'cli', 'ili', 'hh_cmnty_cli', 
+        # 行为 (Behavior)
+        'wearing_mask_7d', 'shop_indoors', 'public_transit',
+        # 信念 (Belief)
+        'wbelief_mask_effective', 'wbelief_distancing_effective',
+        # 心理 (Mental)
+        'wworried_catch_covid', 'wworried_finance',
+        # 环境 (Environmental)
+        'wcovid_vaccinated_friends'
+    ]
+    
+    # 合并列表并去重
+    key_cols = potential_targets + feature_groups
+    
+    # 过滤出实际存在的列
     existing_cols = [c for c in key_cols if c in df.columns]
+    
+    # 如果找不到关键列（比如列名完全不同），则回退到统计所有数值列
+    if not existing_cols:
+        existing_cols = df.select_dtypes(include=['number']).columns[:15].tolist()
+
     if existing_cols:
-        buffer.write(df[existing_cols].describe().to_markdown())
+        # 显示统计信息 (Mean, Std, Min, Max) 对 Agent 判断是否需要 Scaling 至关重要
+        buffer.write(df[existing_cols].describe().T.to_markdown())
             
     return buffer.getvalue()
 
@@ -99,12 +133,12 @@ def main():
     
     # 自动推断 Target 列 (Train 有 but Test 没有的列)
     # 根据你的PPT，Target就是 tested_positive
-    target_col = 'tested_positive'
+    target_col = 'tested_positive_day3'
     
     train_summary = get_data_summary(train_df, "Train Set")
 
     # ==========================================
-    # 🎯 任务 Prompt
+    # 🎯 任务 Prompt (优化版)
     # ==========================================
     task_prompt = f"""
     **角色**: 你是一位 Kaggle Grandmaster，擅长处理时间序列回归问题。
@@ -114,35 +148,52 @@ def main():
     - 训练集: `{train_path}`
     - 测试集: `{test_path}`
 
-    **1. 数据认知 (Data Understanding)**:
-    - **预测目标 (Target)**: `{target_col}`
-    - **语义字典 (Domain Knowledge - 请仔细阅读特征含义)**:
-      {COVID_DATA_DESC}
-    - **数据统计**:
-      {train_summary}
-    - **测试集结构**:
-      列名与训练集一致，但**没有** `{target_col}` 列。
+    **1. 数据认知**:
+    - **Target**: `{target_col}` (0-100 的百分比数值)
+    - **语义字典**: {COVID_DATA_DESC}
+    - **数据统计**: {train_summary}
+    - **重要**: 测试集有tested_positive_day1，tested_positive_day2，没有 `{target_col}` 列。
+    - 本任务允许使用 Autoregression (自回归)。即：可以使用 Day 1 和 Day 2 的所有列（包含 Target 列）作为特征来预测 Day 3。这是合法的。
 
-    **2. 核心约束 (Critical Constraints - 违反将导致严重的过拟合)**:
-    - ❌ **禁止 Shuffle (NO SHUFFLE)**: 这是一个时间序列数据集。在 `train_test_split` 或 `DataLoader` 中，**必须设置 `shuffle=False`**。验证集必须是训练数据的最后 20%。
-    - ❌ **禁止删除 Outliers**: 目标变量中的高值代表疫情爆发，是极具价值的信号。严禁删除目标列的异常值。
-    - ❌ **禁止 Target Clipping**: 在后处理阶段，**不要**对预测结果设置上限 (Clipping)，除非是处理负值。
+    **2. 核心约束 (Critical Constraints)**:
+    - ⚠️ **验证集划分 (Validation Scheme)**: 
+      - 必须使用 `sklearn.model_selection.TimeSeriesSplit` (n_splits=5)。
+      - **最终分数计算**: 必须计算 5 折验证的**平均 MSE** (Average MSE across folds)，以此作为模型的最终评估指标。
+      - 严禁只使用最后一折 (Last Fold Only)，这会导致评估不稳定。
+    - ⚠️ **数据泄露**: 
+      - 在计算最终打印的 `Score` 时，**严禁**使用“训练集覆盖验证集”的模型。
+      - **正确做法**: 只能使用在 `X_train_split` (前80%) 上训练的模型来预测 `X_val` (后20%)。
+      - **错误做法 (严禁)**: 在全量数据 `X_train_full` 上训练，然后预测其中的一部分。这会导致分数为 1.0 (过拟合)。
+    - ⚠️ **Target处理**: Target (`tested_positive_day3`) 是百分比。
+      - 如果使用 **神经网络**：**必须**将 Target 除以 100 或进行 StandardScaler，并在预测后还原。
+      - 如果使用 **树模型 (LGBM/XGB)**：通常不需要处理 Target。
 
     **3. 建模策略 (Modeling Strategy)**:
-    - **特征工程**: 
-      - 必须使用 `StandardScaler` 对特征进行归一化。
-      - 建议使用 `SelectKBest(k=15)` 选择最重要的特征，减少噪音。
-      - 尝试构建交互特征 (例如 `cli` * `wearing_mask_7d`，代表症状与行为的结合)。
-    - **模型架构**: 
-      - 推荐: **PyTorch DNN** (Deep Neural Network)。
-      - 结构: 简单有效为主 (例如 3 层: Input -> 64 -> 32 -> 1)。
-      - 正则化: 必须使用 `BatchNorm1d` 和 `Dropout` (0.1~0.2) 防止过拟合。
-      - 损失函数: 推荐尝试 **`nn.L1Loss()` (MAE)** 进行训练（比 MSE 更抗噪），但最终评估指标仍看 RMSE。
+    - **Draft 阶段强烈建议**: 优先使用 **LightGBM**, **XGBoost** 或 **CatBoost**。
+      - 原因：它们在表格数据上通常比未调优的 DNN 表现更好且更稳定（Score > 0.5）。
+    - **如果不幸使用了 DNN**:
+      - Loss: 必须使用 `nn.MSELoss()`。
+      - DataLoader: 训练集必须 `shuffle=True`，验证集 `shuffle=False`。
+      - 必须做 Target Scaling。
+    - **特征工程 (这是上分的关键!)**: 
+      - 必须构造 **Lag Features (滞后特征)**: 例如 `day1` 的数据是 `day2` 的滞后，`day2` 是 `day3` 的滞后。
+      - 必须构造 **Rolling Features (滚动特征)**: 例如过去 3 天的均值、标准差、最大值。
+      - 尝试 **Target Encoding**: 使用 `State` 的平均阳性率作为特征。
+      - 尝试 **Diff/Trend**: (Day2 - Day1) 表示趋势。
+    - **模型选择**: 继续优先使用 LightGBM/XGBoost/CatBoost。
 
     **4. 输出要求**:
     - 程序必须是单文件 Python 脚本。
-    - 必须在最后一行打印验证分数，格式严格为: `Score= (1.0 / (1.0 + RMSE)) = 0.8` (示例数值)。
-    - 生成 `submission.csv` (包含 `id` 和 `tested_positive` 两列)。
+    - **评分标准**: 请基于 `5-Fold TimeSeriesSplit` 的平均 RMSE 计算最终分数。
+    - 必须在最后一行打印验证分数，格式严格为: `Score= (1.0 / (1.0 + MSE)) = 0.8` (示例)。
+    - 生成 `submission.csv`。
+    - **关于 Score**: 
+      - 程序必须打印的 `Score` 应该是 **Out-of-Sample (样本外)** 验证分数的真实反映。
+      - 建议直接打印 K-Fold CV 的平均分数，或者在 Split 后的 hold-out set 上的分数。
+      - **绝对不要**打印在训练集上的拟合分数！
+    - **关于 Submission**:
+      - 生成 `submission.csv` 时，**允许且建议**使用全量数据 (Train + Val) 重新训练模型，以利用更多数据预测 Test 集。
+      - 但这个全量模型**不能**用来计算上面打印的 Score。
 
     请编写完整的 Python 代码。
     """
@@ -151,7 +202,7 @@ def main():
     # ⚙️ Agent 配置
     # ==========================================
     # 确保 config.py 中 num_drafts >= 3
-    agent = Agent(max_steps=max_steps, timeout=timeout)
+    agent = Agent(max_steps=max_steps,data_preview=train_summary)
 
     try:
         print("\n" + "="*50)

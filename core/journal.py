@@ -32,19 +32,13 @@ class Node:
     # ---- 评价 ----
     score: float = 0.0
     is_buggy: bool = True
-    analysis: str = ""  # 用于存储 Reviewer 的文字评价
+    analysis: str = ""
     
-    def __post_init__(self):
-        if self.parent:
-            self.parent.children.append(self)
-        self.is_buggy = not self.success
+    def __repr__(self):
+        return f"Node({self.node_id}, score={self.score})"
 
     @property
     def summary(self):
-        """
-        [只读属性] 用于打印树状图的简报
-        """
-        # 使用简单的 Emoji 标识状态
         if self.success:
             status = "🟢" 
             metric_str = f"Score: {self.score:.4f}"
@@ -59,39 +53,16 @@ class Node:
 class Journal:
     def __init__(self):
         self.nodes: List[Node] = []
-        self.root: Optional[Node] = None
 
-    def add_node(self, 
-                 parent: Optional[Node], 
-                 code: str, 
-                 thought: str, 
-                 stage: str, 
-                 exec_result: ExecutionResult) -> Node:
-        
-        # 1. 尝试正则提取分数 (作为 Reviewer 之前的兜底)
-        score = self._extract_score(exec_result.output)
-        
-        # 2. 创建节点
-        node = Node(
-            parent=parent,
-            stage=stage,
-            code=code,
-            thought=thought,
-            success=exec_result.success,
-            output=exec_result.output,
-            error=exec_result.error,
-            execution_time=exec_result.execution_time,
-            score=score if exec_result.success else 0.0
-        )
-        
-        # 3. 注册
+    def add_node(self, node: Node):
+        """
+        [关键修复] 直接接收 Agent 创建好的 Node 对象，确保 ID 一致
+        """
+        # 1. 注册节点
         self.nodes.append(node)
-        if parent is None:
-            self.root = node
-            
-        # 实时打印简报
+        
+        # 2. 实时打印简报
         print(f"📝 [Journal] Node Recorded: {node.summary}")
-        return node
 
     def get_best_node(self) -> Optional[Node]:
         successful_nodes = [n for n in self.nodes if n.success]
@@ -100,6 +71,7 @@ class Journal:
         return max(successful_nodes, key=lambda n: n.score)
 
     def get_history_trace(self, node: Node) -> str:
+        # (保持你之前修改好的版本不变)
         path = []
         curr = node
         while curr:
@@ -108,59 +80,49 @@ class Journal:
         path.reverse()
         
         context_str = "--- Previous History Trace ---\n"
-        
-        # 只保留最近的 3 个节点显示完整代码，更早的节点只显示摘要
-        # 这样跑 20 步也不会爆 Context
         full_context_limit = 3 
         
         for i, n in enumerate(path):
             is_recent = (i >= len(path) - full_context_limit)
+            context_str += f"\n=== Step {i+1} [{n.stage.upper()}] ===\n"
             
-            context_str += f"Step {i+1} [{n.stage}]:\n"
+            if n.thought:
+                context_str += f"🧠 Plan/Thought:\n{n.thought.strip()}\n"
+            else:
+                context_str += "🧠 Plan/Thought: (No record)\n"
             
             if is_recent:
-                # 最近的节点：显示较多代码和报错
-                context_str += f"Code Snippet:\n```python\n{n.code} ...\n```\n" 
+                context_str += f"\n💻 Code:\n```python\n{n.code}\n```\n"
                 if not n.success:
-                    context_str += f"Error:\n{n.error}...\n"
+                    error_snippet = n.error[-1000:] if len(n.error) > 1000 else n.error
+                    context_str += f"\n❌ Error Log:\n...{error_snippet}\n"
                 else:
-                    context_str += f"Output Score: {n.score}\n"
-                    if n.analysis: context_str += f"Review: {n.analysis}\n"
+                    context_str += f"\n✅ Execution Output:\nScore: {n.score:.4f}\n"
+                    if n.analysis:
+                        context_str += f"Review Summary: {n.analysis}\n"
             else:
-                # 远古节点：只显示极简摘要 (为了节省 Token)
-                context_str += f"(Old Step) Code Length: {len(n.code)} chars\n"
+                context_str += "\n💻 Code: [Hidden to save tokens]\n"
                 if not n.success:
-                    context_str += "Status: FAILED (Error truncated)\n"
+                    context_str += "❌ Status: FAILED (Execution Error)\n"
                 else:
-                    context_str += f"Status: SUCCESS | Score: {n.score}\n"
-                    
-            context_str += "------------------------\n"
+                    context_str += f"✅ Status: SUCCESS | Score: {n.score:.4f}\n"
+                    if n.analysis:
+                        summary = n.analysis.split('。')[0]
+                        context_str += f"Review: {summary}...\n"
+            
+            context_str += "----------------------------------\n"
             
         return context_str
 
-    def _extract_score(self, text: str) -> float:
-        if not text: return 0.0
-        match = re.search(r'(?:score|accuracy|acc|val_acc|rmse).*?(\d+\.\d+)', text, re.IGNORECASE)
-        if match:
-            try:
-                return float(match.group(1))
-            except:
-                pass
-        return 0.0
     def print_tree(self):
-        """
-        [优化版] 支持打印多棵树（Forest），显示所有 Draft 分支
-        """
         print("\n🌳 === Solution Tree (Forest) ===")
-        
-        # 1. 找到所有的根节点（即没有父节点的节点）
+        # 找到所有根节点（parent 为空的节点）
         roots = [n for n in self.nodes if n.parent is None]
         
         if not roots:
             print("(Empty Tree)")
             return
 
-        # 2. 递归打印函数
         def _print_recursive(node: Node, prefix: str = "", is_last: bool = True):
             connector = "└── " if is_last else "├── "
             print(prefix + connector + node.summary)
@@ -170,10 +132,8 @@ class Journal:
             for i, child in enumerate(node.children):
                 _print_recursive(child, new_prefix, i == child_count - 1)
 
-        # 3. 遍历打印所有的根节点
         for i, root in enumerate(roots):
             is_last_root = (i == len(roots) - 1)
-            # 这里将多个 Draft 视为同级的树根进行打印
             _print_recursive(root, prefix="", is_last=is_last_root)
             
         print("=======================\n")
