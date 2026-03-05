@@ -5,7 +5,7 @@ from openai import OpenAI
 # ==========================================
 # 配置 DeepSeek API
 # ==========================================
-API_KEY = "sk-d66b659120d04f3eb60b79cd88b7b62a"
+API_KEY = "your api-key"
 BASE_URL = "https://api.deepseek.com"
 # export OPENAI_API_KEY="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"
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
