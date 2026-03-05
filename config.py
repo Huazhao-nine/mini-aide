@@ -14,3 +14,5 @@ debug_prob = 0.5
 max_debug_depth = 3
 max_steps=20
 timeout=3600
+
+max_steps = max_steps + num_drafts

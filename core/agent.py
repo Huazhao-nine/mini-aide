@@ -1,331 +1,378 @@
 import json
 import logging
 import random
-import time
-import humanize
+import re
 import textwrap
-from typing import Optional, Dict, Any
-import numpy as np
+from typing import Any, Dict, Optional, Callable
 
-# 引入你的基础设施
 from backend.llm import generate_response
-from core.agent_prompt import AgentPrompt
 from core.interpreter import Interpreter, ExecutionResult
 from core.journal import Journal, Node
 from utils.utils import extract_python_code
 from config import WORKSPACE_DIR, num_drafts, debug_prob, max_debug_depth, timeout
 
+# --- 控制台日志（最小配置）---
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(_h)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
-# 简单的颜色类，用于美化控制台
-class Colors:
-    HEADER = "\033[95m"
-    BLUE = "\033[94m"
-    CYAN = "\033[96m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    ENDC = "\033[0m"
-    BOLD = "\033[1m"
+
+def _extract_first_json_obj(text: str) -> Optional[Dict[str, Any]]:
+    """从 LLM 输出中尽量提取第一个 JSON 对象。"""
+    if not text:
+        return None
+
+    s = text.strip()
+
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            return json.loads(s)
+        except Exception:
+            pass
+
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except Exception:
+            return None
+    return None
 
 
 class Agent:
-    def __init__(self, max_steps, data_preview=None):
-        self.interpreter = Interpreter(workspace_dir=WORKSPACE_DIR, timeout=timeout)
-        self.journal = Journal()
-        self.max_steps = max_steps
-        self.timeout = timeout
-        self.data_preview = data_preview  # 由 run.py 传入的初始数据摘要
+    """简化版 AIDE（但对齐原版 loop / 记忆闭环 / 树搜索语义）。"""
 
-        self.search_cfg = {
-            "num_drafts": num_drafts,
-            "debug_prob": debug_prob,
-            "max_debug_depth": max_debug_depth,
-        }
+    def __init__(
+        self,
+        task_prompt: str,
+        workdir: str,
+        interpreter_factory: Optional[Callable[[str, int], Interpreter]] = None,
+        journal: Optional[Journal] = None,
+    ):
+        self.task_prompt = task_prompt
+        self.workdir = workdir
+        self.num_drafts = int(num_drafts)
+        self.debug_prob = float(debug_prob)
+        self.max_debug_depth = int(max_debug_depth)
+        self.timeout = int(timeout)
 
-        # 核心改进：初始化 Prompt 管理器
-        self.prompt_manager = AgentPrompt(task_desc="")
-
-    def solve(self, task_description: str):
-        # 更新任务描述到管理器
-        self.prompt_manager.task_desc = task_description
-
-        print(
-            f"{Colors.HEADER}🎯 [System] 任务开始: {task_description[:50]}...{Colors.ENDC}"
+        self.journal = journal or Journal()
+        self.interpreter = (
+            interpreter_factory(workdir, self.timeout)
+            if interpreter_factory
+            else Interpreter(workdir=workdir, timeout=self.timeout)
         )
 
-        for step in range(self.max_steps):
-            print(
-                f"\n{Colors.BOLD}{'=' * 20} [Step {step + 1}/{self.max_steps}] Planning {'=' * 20}{Colors.ENDC}"
-            )
-            print(f"{Colors.CYAN}🌳 当前搜索树状态:{Colors.ENDC}")
-            self.journal.print_tree()
+    # -------------------- prompts --------------------
+    def _system_prompt(self) -> str:
+        return (
+            "你是一个在自动实验循环里工作的 ML 工程师 Agent。\n"
+            "每次只做小步、可对比的改动；优先稳定 baseline，再逐步改进。\n"
+            "当被要求“评审执行结果”时，必须输出严格 JSON（不要输出任何多余文本）。\n"
+        )
 
-            # 1. Search Policy (搜索策略)
-            parent_node = self._search_policy()
+    def _draft_prompt(self) -> str:
+        return textwrap.dedent(
+            f"""
+            {self.task_prompt}
 
-            # 2. Action (根据策略生成 Prompt 并调用 LLM)
-            if parent_node is None:
-                print(f"{Colors.CYAN}👉 决策: DRAFT (起草新方案){Colors.ENDC}")
-                new_node = self._draft()
-                stage = "draft"
-            elif parent_node.is_buggy:
-                print(
-                    f"{Colors.YELLOW}👉 决策: DEBUG (修复节点 {parent_node.node_id}){Colors.ENDC}"
-                )
-                new_node = self._debug(parent_node)
-                stage = "debug"
-            else:
-                print(
-                    f"{Colors.BLUE}👉 决策: IMPROVE (优化节点 {parent_node.node_id}, 当前分: {parent_node.score}){Colors.ENDC}"
-                )
-                new_node = self._improve(parent_node)
-                stage = "improve"
+            你现在处于【DRAFT】阶段（从零写 baseline）。
+            要求：
+            - 生成一个完整、可直接运行的 Python 脚本
+            - 方案要稳健、不要花里胡哨
+            - 最后一行必须打印：`FINAL_MSE=<number>`
+            - 如果有测试集，必须写出 `./working/submission.csv`
+            """
+        ).strip()
 
-            # 3. Execution (解释器运行)
-            new_node.stage = stage # 补全 stage 信息
-            if parent_node:
-                new_node.parent = parent_node
-                parent_node.children.append(new_node)
-            filename = f"step{step}-[{stage}]-({new_node.node_id}).py"
-            print(f"🏃 [Interpreter] 正在运行: {filename} ...")
-            result = self.interpreter.run(new_node.code, filename=filename)
+    def _improve_prompt(self, node: Node) -> str:
+        mem = self.journal.build_memory(node)
+        return textwrap.dedent(
+            f"""
+            {self.task_prompt}
 
-            self._print_exec_log(result)
+            你现在处于【IMPROVE】阶段（在当前最优方案上做小步改进）。
+            当前 best 分数（MSE）：{node.score}
 
-            # 4. Review (结果审查)
-            print(f"{Colors.HEADER}🤔 [Reviewer] 正在评估运行结果...{Colors.ENDC}")
-            review_data = self._review_execution(new_node.code, result)
+            当前代码：
+            ```python
+            {node.code}
+            ```
 
-            # 5. Update Memory (更新节点信息)
-            self._update_node_with_result(new_node, result, review_data)
-            self.journal.add_node(new_node)
+            记忆 / 历史经验（用于避免重复踩坑）：
+            {mem}
 
-            # 同步 Review 数据
-            last_node = self.journal.nodes[-1]
-            last_node.score = review_data.get("score", 0.0)
-            last_node.is_buggy = review_data.get("is_bug", True)
-            last_node.analysis = review_data.get("summary", "")
+            要求：
+            - 只做一个“小改动”（原子级改进：一个想法/一个改动点）
+            - 必须可运行
+            - 最后一行必须打印：`FINAL_MSE=<number>`
+            - 如果有测试集，必须写出 `./working/submission.csv`
+            """
+        ).strip()
 
-            if last_node.is_buggy:
-                print(
-                    f"{Colors.RED}📊 评估结果: BUG ❌ | 概要: {last_node.analysis}{Colors.ENDC}"
-                )
-            else:
-                print(
-                    f"{Colors.GREEN}📊 评估结果: PASS ✅ | 分数: {last_node.score:.4f}{Colors.ENDC}"
-                )
-                print(f"   💡 评价: {last_node.analysis}")
+    def _debug_prompt(self, node: Node) -> str:
+        mem = self.journal.build_memory(node)
+        return textwrap.dedent(
+            f"""
+            {self.task_prompt}
 
-            # 提前结束检查
-            if last_node.score >= 0.999:
-                break
+            你现在处于【DEBUG】阶段（修复崩溃/协议错误/输出无效等问题）。
+            下面这份代码执行失败或输出不合规：
 
-        # 任务总结与最佳方案恢复
-        best_node = self.journal.get_best_node()
-        self._print_summary()
+            代码：
+            ```python
+            {node.code}
+            ```
 
-        if best_node:
-            print(
-                f"\n{Colors.BLUE}🔄 [系统] 恢复最佳方案 (ID: {best_node.node_id}) ...{Colors.ENDC}"
-            )
-            self.interpreter.run(best_node.code, filename="BEST_SOLUTION.py")
-            return best_node.code
-        return None
+            执行输出（stdout+stderr）：
+            ```text
+            {node.output}
+            ```
 
-    # ==========================================
-    # 🧠 Logic: Search Policy (采样逻辑)
-    # ==========================================
-    def _search_policy(self) -> Optional[Node]:
-        draft_nodes = [n for n in self.journal.nodes if n.stage == "draft"]
-        if len(draft_nodes) < self.search_cfg["num_drafts"]:
-            return None
+            记忆 / 历史经验：
+            {mem}
 
-        buggy_leaves = [
-            n for n in self.journal.nodes if n.is_buggy and len(n.children) == 0
+            要求：
+            - 最小改动修复问题
+            - 必须可运行
+            - 最后一行必须打印：`FINAL_MSE=<number>`
+            - 如果有测试集，必须写出 `./working/submission.csv`
+            """
+        ).strip()
+
+    # -------------------- policy --------------------
+    def search_policy(self) -> Dict[str, Any]:
+        """对齐原版 AIDE：
+        1) draft 到足够 root
+        2) 以 debug_prob 概率 debug 一个 buggy leaf（且 debug 深度受限）
+        3) 否则 greedy improve 当前 best
+        """
+        if len(self.journal.draft_nodes) < self.num_drafts:
+            return {"action": "draft", "parent": None}
+
+        buggy_leaf = self.journal.sample_buggy_leaf()
+        if buggy_leaf is not None and buggy_leaf.debug_depth < self.max_debug_depth:
+            if random.random() < self.debug_prob:
+                return {"action": "debug", "parent": buggy_leaf}
+
+        best = self.journal.get_best_node()
+        if best is None:
+            return {"action": "draft", "parent": None}
+        return {"action": "improve", "parent": best}
+
+    # -------------------- LLM interaction --------------------
+    def _llm_call(self, user_prompt: str) -> str:
+        """适配你当前的 DeepSeek wrapper: generate_response(messages, temperature) -> (content, reasoning)"""
+        messages = [
+            {"role": "system", "content": self._system_prompt()},
+            {"role": "user", "content": user_prompt},
         ]
-        current_step = len(self.journal.nodes)
-        progress = current_step / self.max_steps
 
-        dynamic_debug_prob = self.search_cfg["debug_prob"] * (1 - progress)
-        if buggy_leaves and random.random() < dynamic_debug_prob:
-            return random.choice(buggy_leaves)
+        resp = generate_response(messages=messages)
 
-        successful_nodes = [n for n in self.journal.nodes if n.success]
-        if not successful_nodes:
+        if isinstance(resp, tuple) and len(resp) >= 1:
+            return (resp[0] or "").strip()
+        if isinstance(resp, str):
+            return resp.strip()
+        return ""
+
+    def _generate_code(self, action: str, parent: Optional[Node]) -> str:
+        if action == "draft":
+            prompt = self._draft_prompt()
+        elif action == "improve":
+            assert parent is not None
+            prompt = self._improve_prompt(parent)
+        elif action == "debug":
+            assert parent is not None
+            prompt = self._debug_prompt(parent)
+        else:
+            raise ValueError(f"未知 action: {action}")
+
+        raw = self._llm_call(prompt)
+        code = extract_python_code(raw)
+        return code.strip() or raw.strip()
+
+    # -------------------- execution + review --------------------
+    def _execute(self, code: str) -> ExecutionResult:
+        return self.interpreter.run(code)
+
+    def _programmatic_metric_extract(self, text: str) -> Optional[float]:
+        if not text:
+            return None
+        m = re.search(r"FINAL_MSE\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", text)
+        if not m:
+            return None
+        try:
+            v = float(m.group(1))
+            if v != v or v < 0:
+                return None
+            return v
+        except Exception:
             return None
 
-        candidates = [n for n in successful_nodes if n.score > 0.4]
-        if not candidates:
-            candidates = successful_nodes
+    def _llm_review(self, task_desc: str, code: str, output: str) -> Optional[Dict[str, Any]]:
+        """AIDE 核心：高信息量的结构化评审（JSON）→ 写入 node.analysis，供后续 memory 使用。"""
+        review_prompt = textwrap.dedent(
+            f"""
+            你是一个 Kaggle 老手，正在评审一次代码执行结果。
 
-        scores = np.array([n.score for n in candidates])
-        T = 1.5 * (1 - progress) + 0.1
-        scale_factor = 20.0
-        exp_scores = np.exp((scores * scale_factor - np.max(scores * scale_factor)) / T)
-        probs = exp_scores / np.sum(exp_scores)
+            你必须只输出【严格 JSON】（不要任何多余文字、不要 Markdown），并且必须包含以下 key：
+            - is_bug (boolean)：是否认为这次运行“有问题”（崩溃/指标缺失/协议不合规/明显泄漏等）
+            - summary (string)：如果有问题，给出明确的修复建议；如果没问题，用 2~3 句话总结发现，并给下一步改进方向
+            - metric (number or null)：如果能拿到有效的验证 MSE，就填数值，否则填 null
+            - lower_is_better (boolean)：本任务 MSE 越小越好，填 true
 
-        return np.random.choice(candidates, p=probs)
+            判断规则：
+            - 如果运行崩溃、缺 FINAL_MSE、submission 路径/列错误、明显泄漏、验证协议不对，都算 is_bug=true
+            - metric 应该是 5 折 OOF MSE（如果输出里有）
+            - summary 要“可执行”：能指导下一轮 debug/improve
 
-    # ==========================================
-    # 🎨 Actions: 使用 AgentPrompt 生成内容
-    # ==========================================
+            【任务描述】：
+            {task_desc}
 
-    def _draft(self) -> Node:
-        # 获取历史轨迹摘要
-        history = (
-            self.journal.get_history_trace(None)
-            if self.journal.nodes
-            else "这是第一个节点。"
-        )
-        # 获取 Prompt 字典并格式化为字符串
-        prompt_dict = self.prompt_manager.get_draft_prompt(history, self.data_preview)
+            【代码】：
+            {code}
 
-        sys_msg = prompt_dict.pop("系统消息 (Introduction)")
-        user_msg = self._dict_to_formatted_str(prompt_dict)
+            【执行输出】：
+            {output}
+            """
+        ).strip()
 
-        self._log_prompt("DRAFT", user_msg)
-        return self._query_llm(sys_msg, user_msg)
+        resp = self._llm_call(review_prompt)
+        obj = _extract_first_json_obj(resp)
+        if not isinstance(obj, dict):
+            return None
 
-    def _improve(self, parent_node: Node) -> Node:
-        # 获取日志摘要
-        journal_summary = self.journal.get_history_trace(parent_node)
-        prompt_dict = self.prompt_manager.get_improve_prompt(
-            journal_summary, parent_node.code
-        )
+        out: Dict[str, Any] = {}
+        out["is_bug"] = bool(obj.get("is_bug", False))
+        out["summary"] = str(obj.get("summary", "")).strip()
+        metric = obj.get("metric", None)
+        out["metric"] = float(metric) if isinstance(metric, (int, float)) else None
+        out["lower_is_better"] = bool(obj.get("lower_is_better", True))
+        return out
 
-        sys_msg = prompt_dict.pop("系统消息 (Introduction)")
-        user_msg = self._dict_to_formatted_str(prompt_dict)
+    def _review_execution(self, code: str, result: ExecutionResult) -> Dict[str, Any]:
+        combined = (result.output or "").strip()
+        metric = self._programmatic_metric_extract(combined)
 
-        self._log_prompt("IMPROVE", f"Optimizing Node {parent_node.node_id}")
-        return self._query_llm(sys_msg, user_msg)
+        llm = self._llm_review(self.task_prompt, code, combined)
+        if llm is not None:
+            if llm.get("metric") is None and metric is not None:
+                llm["metric"] = metric
+            if (not result.success) or (llm.get("metric") is None):
+                llm["is_bug"] = True
+            return llm
 
-    def _debug(self, parent_node: Node) -> Node:
-        prompt_dict = self.prompt_manager.get_debug_prompt(
-            parent_node.code, parent_node.error, self.data_preview
-        )
-
-        sys_msg = prompt_dict.pop("系统消息 (Introduction)")
-        user_msg = self._dict_to_formatted_str(prompt_dict)
-
-        self._log_prompt("DEBUG", f"Fixing Node {parent_node.node_id}")
-        return self._query_llm(sys_msg, user_msg)
-
-    def _review_execution(self, code, result) -> Dict[str, Any]:
-        # 1. 解释器层面的硬错误快速返回
+        # fallback（无 LLM JSON 时）
         if not result.success:
             return {
                 "is_bug": True,
-                "score": 0.0,
-                "summary": f"执行崩溃: {result.error[:200]}",
+                "summary": (result.error or "执行失败")[:400],
+                "metric": None,
+                "lower_is_better": True,
             }
 
-        # 2. 获取 Prompt (所有指令都在这里面了)
-        prompt_dict = self.prompt_manager.get_review_prompt(code, result.output)
-        sys_msg = prompt_dict.pop("系统消息 (Introduction)")
-        user_msg = self._dict_to_formatted_str(prompt_dict)
-
-        try:
-            content, _ = generate_response(
-                [{"role": "user", "content": f"{sys_msg}\n\n{user_msg}"}], 
-                temperature=0
-            )
-            
-            # 4. JSON 清洗与解析逻辑
-            # 移除可能的 markdown 代码块标记
-            json_str = content.replace("```json", "").replace("```", "").strip()
-            
-            # 寻找 JSON 对象的边界 (防御性编程)
-            if "{" in json_str:
-                start = json_str.find("{")
-                end = json_str.rfind("}") + 1
-                json_str = json_str[start:end]
-            
-            return json.loads(json_str)
-
-        except Exception as e:
-            print(f"{Colors.RED}Review 解析异常: {e} | Content: {content[:50]}...{Colors.ENDC}")
+        if metric is None:
             return {
                 "is_bug": True,
-                "score": 0.0,
-                "summary": f"Review 解析失败: {str(e)}",
+                "summary": "没有找到 FINAL_MSE；请确保脚本最后一行打印 FINAL_MSE=<number>。",
+                "metric": None,
+                "lower_is_better": True,
             }
-    # ==========================================
-    # 🛠️ Helpers (辅助工具)
-    # ==========================================
 
-    def _query_llm(self, sys_msg, user_msg) -> Node:
-        messages = [
-            {"role": "system", "content": sys_msg},
-            {"role": "user", "content": user_msg}
-        ]
-        
-        # 1. 获取原始响应
-        # content 包含：[自然语言大纲] + [```python 代码 ```]
-        # reasoning 包含：DeepSeek R1 的隐式思维链 (如果你想存也可以存)
-        full_content, reasoning = generate_response(messages)
-        
-        # 2. 解析代码
-        code = extract_python_code(full_content)
-        
-        # 3. 解析大纲 (Thought/Plan)
-        # 逻辑：取第一个代码块 ``` 之前的所有文本作为大纲
-        if "```" in full_content:
-            # split 之后的第一个元素就是代码块前面的文本
-            thought = full_content.split("```")[0].strip()
+        return {
+            "is_bug": False,
+            "summary": f"验证 OOF MSE = {metric:.6f}。建议在保持协议正确的前提下做小步特征/模型改进。",
+            "metric": metric,
+            "lower_is_better": True,
+        }
+
+    # -------------------- state update --------------------
+    def _update_node_with_result(self, node: Node, code: str, result: ExecutionResult, review: Dict[str, Any]) -> None:
+        node.code = code
+        node.success = bool(result.success)
+        node.output = (result.output or "").strip()
+        node.error = (result.error or "").strip()
+        node.execution_time = float(result.execution_time or 0.0)
+
+        node.analysis = str(review.get("summary", "")).strip()
+
+        is_bug = bool(review.get("is_bug", False))
+        metric = review.get("metric", None)
+
+        # 对齐 AIDE：执行失败 / 无指标 → 直接视为 buggy
+        if (not node.success) or (metric is None):
+            node.is_buggy = True
+            node.score = 9999.0
         else:
-            # 如果没有代码块（比如 LLM 拒绝生成），则整体都是思考
-            thought = full_content.strip()
-            
-        # 4. (可选) 如果你想把 R1 的深度思考也记录下来，可以拼接到 thought 里
-        # thought = f"[DeepSeek Reasoning]\n{reasoning}\n\n[Plan]\n{thought}"
+            node.is_buggy = is_bug
+            node.score = float(metric)
 
-        return Node(code=code, thought=thought, output="", success=False)
+    # -------------------- main loop --------------------
+    def run(self, max_steps) -> None:
+        for step in range(int(max_steps)):
+            policy = self.search_policy()
+            action: str = policy["action"]
+            parent: Optional[Node] = policy["parent"]
 
-    def _dict_to_formatted_str(self, data: Any, indent=0) -> str:
-        """将复杂的字典结构转换为清晰的 Prompt 文本"""
-        res = []
-        if isinstance(data, dict):
-            for k, v in data.items():
-                res.append(f"{'  ' * indent}### {k}")
-                res.append(self._dict_to_formatted_str(v, indent + 1))
-        elif isinstance(data, list):
-            for item in data:
-                res.append(f"{'  ' * indent}* {item}")
-        else:
-            res.append(f"{'  ' * indent}{data}")
-        return "\n".join(res)
+            best_before = self.journal.get_best_node()
+            best_str = f"{best_before.score:.6f}（{best_before.node_id}）" if best_before else "None"
+            parent_str = parent.node_id if parent else "None"
 
-    def _update_node_with_result(self, node, result, review_data):
-        node.output = result.output
-        node.error = result.error
-        node.execution_time = result.execution_time
-        node.success = result.success and not review_data.get("is_bug", True)
+            logger.info(f"\n===== 第 {step+1}/{int(max_steps)} 轮 =====")
+            logger.info(f"策略选择：action={action} | parent={parent_str} | 当前best={best_str}")
 
-    def _log_prompt(self, type_name, prompt_content):
-        print(f"\n{Colors.CYAN}--- [Prompt: {type_name}] ---{Colors.ENDC}")
-        print(textwrap.indent(prompt_content.strip(), "    "))
-        print(f"{Colors.CYAN}----------------------------{Colors.ENDC}\n")
+            logger.info("LLM：开始生成代码...")
+            code = self._generate_code(action, parent)
+            logger.info(f"LLM：代码生成完成（长度={len(code)}）")
 
-    def _print_exec_log(self, result):
-        if result.success:
-            print(
-                f"{Colors.GREEN}✅ 运行成功 ({result.execution_time:.2f}s){Colors.ENDC}"
-            )
-            lines = result.output.strip().split("\n")
-            print(
-                "📄 输出摘要:\n"
-                + ("\n".join(lines[-5:]) if len(lines) > 5 else result.output)
-            )
-        else:
-            print(f"{Colors.RED}❌ 运行失败: {result.error[:200]}...{Colors.ENDC}")
+            node = self.journal.add_node(code=code, parent=parent, stage=action)
+            logger.info(f"节点创建：id={node.node_id} | stage={node.stage}")
 
-    def _print_summary(self):
-        print(
-            f"\n{Colors.BOLD}=" * 50 + "\n📊 执行总结\n" + "=" * 50 + f"{Colors.ENDC}"
-        )
-        self.journal.print_tree()
+            logger.info("执行：运行 working/solution.py ...")
+            result = self._execute(code)
+            logger.info(f"执行结果：success={result.success} | 用时={result.execution_time:.2f}s | err={result.error or '-'}")
+
+            if result.output:
+                tail = "\n".join(result.output.splitlines()[-30:])
+                logger.info("输出末尾（最后 30 行）：\n" + tail)
+
+            logger.info("评审：解析 FINAL_MSE + 结构化评审（bug/summary/metric）...")
+            review = self._review_execution(code, result)
+
+            self._update_node_with_result(node, code, result, review)
+            logger.info(f"本轮结果：node={node.node_id} | MSE={node.score:.6f} | buggy={node.is_buggy}")
+
+            if node.analysis:
+                logger.info("评审摘要：" + node.analysis[:600])
+
+            best_now = self.journal.get_best_node()
+            best_now_str = f"{best_now.score:.6f}（{best_now.node_id}）" if best_now else "None"
+            logger.info(f"当前最优：{best_now_str}")
+
+            # 每轮打印树结构
+            self.journal.print_tree()
+
+            # 保存 journal 快照
+            self.journal.save(WORKSPACE_DIR)
+
         best = self.journal.get_best_node()
-        if best:
-            print(
-                f"{Colors.GREEN}🏆 最佳分数: {best.score} (ID: {best.node_id}){Colors.ENDC}"
-            )
+        if best is not None:
+            logger.info(f"✅ 最终最优节点：{best.node_id} | MSE={best.score:.6f}")
+        else:
+            logger.info("⚠️ 最终没有找到有效（非 buggy）的节点。")
+
+        logger.info("最终树结构：")
+        self.journal.print_tree()

@@ -1,4 +1,5 @@
-from config import WORKSPACE_DIR,num_drafts,debug_prob,max_debug_depth,timeout
+from config import WORKSPACE_DIR, timeout
+
 
 class AgentPrompt:
     def __init__(self, task_desc):
@@ -6,157 +7,154 @@ class AgentPrompt:
         self.timeout = timeout
         self.workspace_dir = WORKSPACE_DIR
 
-    # ==========================================
-    # 📚 1. 通用组件 (Common Components)
-    # ==========================================
-
     @property
-    def _prompt_resp_fmt(self):
+    def _resp_fmt(self):
         return {
-            "回复格式 (Response format)": (
-                "你的回复应该是用自然语言对你建议的解决方案的简要大纲/草图，"
-                "紧接着是一个实现该解决方案并打印评估指标的 "
-                "Markdown 代码块（包裹在 ```python ``` 中）。你的回复中不应包含额外的标题或文本。"
-                "只需解决方案的简要大纲/草图，后跟一个换行符，然后是 Markdown 代码块。"
-            )
-        }
-
-    @property
-    def _prompt_impl_guideline(self):
-        return {
-            "实现指南 (Implementation guideline)": [
-                "代码应**实现建议的解决方案**并**打印在留出验证集 (hold-out validation set) 上计算的评估指标值**。",
-                "代码应该是一个单文件 Python 程序，自包含且可以原样执行。",
-                "代码的任何部分都不应被跳过，不要在脚本完成之前终止。",
-                f"注意代码的运行时间，它应在{self.timeout}秒内完成。",
-                "所有提供的输入数据都存储在 './input' 目录下。",
-                "如果你为该任务提供了测试数据，请按照任务描述中的说明，将测试预测结果保存到 `submission.csv` 文件中。"
-                "这非常重要，因为该文件用于评分/评估。不要忘记 `submission.csv` 文件！",
-                f"你也可以使用 `{self.workspace_dir}` 目录来存储你的代码需要创建的任何临时文件。",
-                "评估应基于 K 折交叉验证，但前提是这对当前任务是合适的评估方法，并且 K 值根据具体任务来选择。"
+            "回复格式": [
+                "先写 3-5 句简短方案说明。",
+                "然后输出且只输出一个 ```python``` 代码块。",
+                "不要输出第二个代码块，不要省略代码。",
             ]
         }
 
     @property
-    def _prompt_environment(self):
+    def _protocol(self):
         return {
-            "运行环境 (Installed Packages)": (
-                "你的解决方案可以使用任何相关的机器学习包，例如：`numpy`, `pandas`, `scikit-learn`, "
-                "`statsmodels`, `xgboost`, `lightGBM`, `torch`, `torchvision`, `torch-geometric`, "
-                "`bayesian-optimization`, `timm`。请随意使用其他包（所有包都已安装！）。"
-                "对于神经网络，我们建议使用 PyTorch 而不是 TensorFlow。"
-            )
+            "输出协议": [
+                "脚本最后必须打印：FINAL_MSE=<数值>。",
+                "可选打印：FINAL_INFO=<json字符串>，用于记录模型家族、CV、seed、feature_count 等。",
+                "如果原方案已生成 submission.csv，除非本轮明确针对提交逻辑，否则不要破坏它。",
+            ]
         }
 
-    # ==========================================
-    # 🎯 2. 阶段一：起草 (Draft)
-    # ==========================================
+    @property
+    def _env(self):
+        return {
+            "运行环境": [
+                "你输出的是单文件 Python 脚本，本地直接执行。",
+                f"工作目录：{self.workspace_dir}",
+                f"时间限制：约 {self.timeout} 秒。",
+                "可使用 numpy/pandas/scikit-learn/lightgbm/xgboost/torch。若任务要求 DNN，优先 PyTorch。",
+            ]
+        }
 
-    def get_draft_prompt(self, history_trace, data_preview=None):
+    @property
+    def _general_rules(self):
+        return {
+            "通用约束": [
+                "优先保留父方案已验证有效的部分。",
+                "不要做 EDA、交互式可视化或长篇分析。",
+                "避免数据泄漏，注意 split/CV/scaler 的 fit-transform 边界。",
+                "一次只改一个主要因素，保证实验可比较。",
+                "尽量固定 random/numpy/torch 的随机种子。",
+            ]
+        }
+
+    def _base_prompt(self):
+        base = {}
+        base.update(self._resp_fmt)
+        base.update(self._protocol)
+        base.update(self._env)
+        base.update(self._general_rules)
+        return base
+
+    def get_draft_prompt(self, history, data_preview=None, force_new_family: bool = False):
+        draft_rules = [
+            "先写出稳定、可运行、评估逻辑正确的 baseline。",
+            "若任务描述明确要求 DNN/MLP 主线，则优先使用 PyTorch MLP，而不是树模型。",
+            "Draft 阶段先建立一条强而稳的单模型主线，不要一开始做 stacking 或大规模超参搜索。",
+            "必须保证 metric、CV、submission、特征边界都正确。",
+        ]
+        if force_new_family:
+            draft_rules.append("当前搜索已停滞：请换一个与最近最佳方案明显不同的 DNN 变体，例如更稳的 MLP 结构、不同归一化/激活/正则主线，但仍保持简单。")
+
         prompt = {
-            "系统消息 (Introduction)": "你是一位参加竞赛的 Kaggle Grandmaster。为了赢得这次比赛，你需要想出一个出色且有创意的解决方案计划，然后用 Python 实现这个解决方案。我们现在提供任务描述。",
-            "任务描述 (Task description)": self.task_desc,
-            "记忆 (Memory)": history_trace,
-            "指令 (Instructions)": {
-                "解决方案草图指南 (Solution sketch guideline)": [
-                    "第一个解决方案设计应该相对简单，不包含集成 (ensembling) 或超参数优化。",
-                    "在提出设计时要考虑历史节点的做法，不要提出相同的建模解决方案，但保持评估方法一致。",
-                    "解决方案草图应为 3-5 句话。",
-                    "提出一个对该任务合理的评估指标。",
-                    "不要建议做探索性数据分析 (EDA)。",
-                    "数据已准备好并在 `./input` 目录下可用。无需解压任何文件。"
-                ]
-            }
+            "系统消息": "你是一个通用机器学习/深度学习竞赛代理。当前任务优先构造深度学习可运行强基线。",
+            "任务描述": self.task_desc,
+            "精简历史摘要": history,
+            "Draft要求": draft_rules,
         }
-        # 整合通用组件
-        prompt["指令 (Instructions)"].update(self._prompt_resp_fmt)
-        prompt["指令 (Instructions)"]["实现指南 (Implementation guideline)"] = self._prompt_impl_guideline["实现指南 (Implementation guideline)"]
-        prompt["指令 (Instructions)"].update(self._prompt_environment)
-        
+        # if data_preview:
+            # prompt["数据概览"] = data_preview
+        prompt.update(self._base_prompt())
         return prompt
 
-    # ==========================================
-    # 📈 3. 阶段二：改进 (Improve)
-    # ==========================================
-
-    def get_improve_prompt(self, journal_summary, parent_node_code):
-        prompt = {
-            "系统消息 (Introduction)": (
-                "你是一位参加竞赛的 Kaggle Grandmaster。下面提供了一个先前开发的解决方案，你应该对其进行改进以进一步提高（测试时）性能。"
-                "为此，你应该首先用自然语言概述如何改进解决方案的简要计划，然后基于提供的先前解决方案用 Python 实现此改进。"
-            ),
-            "任务描述 (Task description)": self.task_desc,
-            "记忆 (Memory)": journal_summary,
-            "先前解决方案 (Previous solution)": {
-                "代码 (Code)": f"```python\n{parent_node_code}\n```"
-            },
-            "指令 (Instructions)": {
-                "解决方案改进草图指南 (Solution improvement sketch guideline)": [
-                    "解决方案草图应该是对如何改进先前解决方案的简要自然语言描述。",
-                    "你应该非常具体，并且只应提出一个可执行的改进。",
-                    "这个改进应该是原子性的 (atomic)，以便我们可以通过实验评估所提出更改的效果。",
-                    "在提出改进时要考虑历史节点的做法。",
-                    "解决方案草图应为 3-5 句话。",
-                    "不要建议做探索性数据分析 (EDA)。"
-                ]
-            }
+    def get_improve_prompt(self, journal_summary, parent_node_code, change_type="feature"):
+        hard_templates = {
+            "feature": [
+                "只允许改特征处理或输入表示；不要改模型家族、CV 主干、训练主干。",
+                "如果任务中禁止对 tested_positive_* 派生，则必须遵守。",
+                "优先尝试安全模板：非 tested_positive_* 的跨天差分、比例、mean/std/min/max，其它部分保持不变。",
+            ],
+            "model": [
+                "只允许改一个主要模型因素；不要同时改特征、CV、训练流程。",
+                "在 DNN 主线内做小改：层宽、层数、激活、BN/LayerNorm、dropout、残差（若实现很简单）。",
+                "不要突然切到树模型，除非任务描述没有 DNN 偏好且历史已明确 DNN 全线失败。",
+            ],
+            "training": [
+                "只允许改优化器、学习率、batch size、epoch、scheduler、patience、gradient clipping、seed 等训练细节。",
+                "不要改特征工程、CV 主干、模型结构。",
+            ],
+            "regularization": [
+                "只允许改一个主要正则化因素，如 dropout、weight decay、早停、label clipping、目标缩放处理等。",
+                "不要顺带重构模型或验证方案。",
+            ],
+            "validation": [
+                "只允许改 split/CV/OOF 聚合/metric 监控方式；不要改模型主干和特征工程。",
+                "只有在当前验证不稳或疑似泄漏时才值得动这类改动。",
+            ],
+            "submission": [
+                "只允许改测试集推理、fold 预测聚合、列对齐、后处理、导出格式等提交相关逻辑。",
+                "不要改 local validation 主干，不要改模型或主要特征。",
+            ],
         }
-        
-        # 整合通用组件
-        prompt["指令 (Instructions)"].update(self._prompt_resp_fmt)
-        prompt["指令 (Instructions)"]["实现指南 (Implementation guideline)"] = self._prompt_impl_guideline["实现指南 (Implementation guideline)"]
-        prompt["指令 (Instructions)"].update(self._prompt_environment)
-        
-        return prompt
 
-    # ==========================================
-    # 🛠️ 4. 阶段三：调试 (Debug)
-    # ==========================================
+        improve_rules = [
+            "只提出并实现一个 actionable improvement。",
+            "必须保留 FINAL_MSE 协议。",
+            "如果父方案已有正确评分/提交主干，优先保留。",
+            "不要做与本轮改动无关的大改写。",
+            "不要复述历史中已经明确失败的方向。",
+        ]
+
+        prompt = {
+            "系统消息": "你要基于一个已可运行父方案做一次原子化改进。只做一个明确、可归因、可比较的改动。",
+            "任务描述": self.task_desc,
+            "精简历史经验": journal_summary,
+            "父方案代码": f"```python\n{parent_node_code}\n```",
+            "本轮改动类型": change_type,
+            "Improve要求": improve_rules,
+            "本轮硬约束": hard_templates.get(change_type, hard_templates["feature"]),
+        }
+        prompt.update(self._base_prompt())
+        return prompt
 
     def get_debug_prompt(self, parent_node_code, term_out, data_preview=None):
         prompt = {
-            "系统消息 (Introduction)": (
-                "你是一位参加竞赛的 Kaggle Grandmaster。你之前的解决方案有一个 Bug，因此基于以下信息，你应该对其进行修改以修复此 Bug。"
-                "你的回复应该是自然语言的实现大纲，紧接着是一个实现 Bug 修复/解决方案的 Markdown 代码块。"
-            ),
-            "任务描述 (Task description)": self.task_desc,
-            "先前(有Bug的)实现 (Previous (buggy) implementation)": f"```python\n{parent_node_code}\n```",
-            "执行输出 (Execution output)": f"```\n{term_out}\n```",
-            "指令 (Instructions)": {
-                "Bug修复草图指南 (Bugfix improvement sketch guideline)": [
-                    "你应该写一段简短的自然语言描述（3-5 句话），说明如何修复先前实现中的问题。",
-                    "不要建议做探索性数据分析 (EDA)。"
-                ]
-            }
+            "系统消息": "你之前的代码运行失败了。请做最小限度修复，优先恢复可运行性、评分协议与已有有效逻辑。",
+            "任务描述": self.task_desc,
+            "先前实现": f"```python\n{parent_node_code}\n```",
+            "执行输出": f"```\n{term_out}\n```",
+            "Debug要求": [
+                "只修当前 bug，不要顺手重构整套方案。",
+                "若是列名/shape/类型/协议错误，直接修相应位置。",
+                "若父方案已有正确评估/提交主干，调试时必须保留。",
+            ],
         }
         if data_preview:
-            prompt["数据概览 (Data Overview)"] = data_preview
-            
-        # 整合通用组件
-        prompt["指令 (Instructions)"].update(self._prompt_resp_fmt)
-        prompt["指令 (Instructions)"]["实现指南 (Implementation guideline)"] = self._prompt_impl_guideline["实现指南 (Implementation guideline)"]
-        prompt["指令 (Instructions)"].update(self._prompt_environment)
-        
+            prompt["数据概览"] = data_preview
+        prompt.update(self._base_prompt())
         return prompt
-
-# ==========================================
-    # ⚖️ 5. 结果审查 (Result Review)
-    # ==========================================
 
     def get_review_prompt(self, code, term_out):
         return {
-            "系统消息 (Introduction)": "你是一位参加竞赛的 Kaggle Grandmaster。你已经编写了代码来解决此任务，现在需要评估代码执行的输出。你应该确定是否存在任何 Bug，并报告实证发现。",
-            "任务描述 (Task description)": self.task_desc,
-            "实现代码 (Implementation)": f"```python\n{code}\n```",
-            "执行输出 (Execution output)": f"```\n{term_out}\n```",
-            "裁判任务": [
-                "1. 提取分数: 寻找输出中类似 'Score: 0.1234' 或 'MSE: ...' 的行。",
-                "2. 判定 Bug: 如果出现 Traceback/Error 或 Score 无效（NaN/0.0/未找到），则 is_bug=True。",
-                "3. 总结: 描述实验结果或提出修复建议。"
+            "系统消息": "请基于执行输出做极简评审。系统会程序解析 FINAL_MSE，你只需要给一句到四句的有效总结。",
+            "任务描述": self.task_desc,
+            "实现代码": f"```python\n{code}\n```",
+            "执行输出": f"```\n{term_out}\n```",
+            "评审任务": [
+                "判断这次运行是否有效。",
+                "如果有效，说明主要瓶颈。",
+                "给出下一步最值得尝试的一类原子化改动。",
             ],
-            # ✅ 新增：在这里定义输出格式，而不是在 Agent 里拼接
-            "输出格式 (Output Format)": (
-                "请严格只输出一个 JSON 对象，不要包含 Markdown 格式（如 ```json）。格式如下：\n"
-                '{"is_bug": boolean, "score": float, "summary": "string"}'
-            )
         }
