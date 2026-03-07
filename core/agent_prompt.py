@@ -21,7 +21,7 @@ class AgentPrompt:
     def _protocol(self):
         return {
             "输出协议": [
-                "脚本最后必须打印：FINAL_MSE=<数值>。",
+                "脚本最后必须打印：FINAL_SCORE=<数值>。",
                 "可选打印：FINAL_INFO=<json字符串>，用于记录模型家族、CV、seed、feature_count 等。",
                 "如果原方案已生成 submission.csv，除非本轮明确针对提交逻辑，否则不要破坏它。",
             ]
@@ -111,7 +111,7 @@ class AgentPrompt:
 
         improve_rules = [
             "只提出并实现一个 actionable improvement。",
-            "必须保留 FINAL_MSE 协议。",
+            "必须保留 FINAL_SCORE 协议。",
             "如果父方案已有正确评分/提交主干，优先保留。",
             "不要做与本轮改动无关的大改写。",
             "不要复述历史中已经明确失败的方向。",
@@ -148,7 +148,7 @@ class AgentPrompt:
 
     def get_review_prompt(self, code, term_out):
         return {
-            "系统消息": "请基于执行输出做极简评审。系统会程序解析 FINAL_MSE，你只需要给一句到四句的有效总结。",
+            "系统消息": "请基于执行输出做极简评审。系统会程序解析 FINAL_SCORE，你只需要给一句到四句的有效总结。",
             "任务描述": self.task_desc,
             "实现代码": f"```python\n{code}\n```",
             "执行输出": f"```\n{term_out}\n```",

@@ -2,30 +2,27 @@ import re
 
 def extract_python_code(text):
     """
-    从 LLM 的回复中提取 Python 代码块。
-    策略：
-    1. 优先寻找 ```python ... ``` 包裹的内容。
-    2. 如果没有指定语言，寻找 ``` ... ``` 包裹的内容。
-    3. 如果有多个代码块，默认将其拼接（适应分段输出的情况）。
-    4. 如果完全没有 Markdown 标记，尝试直接返回文本（作为兜底，但会有风险）。
+    从 LLM 回复中提取 Python 代码块。
+
+    这是 coding operator 的一个很关键的小工具。论文把搜索对象定义为“代码空间中的解”，
+    所以上层必须稳定地把模型回复还原成真正可执行的脚本。这里采用较宽松的提取策略：
+    1. 优先寻找 ```python ... ```；
+    2. 否则接受普通 ``` ... ```；
+    3. 多个代码块时拼接，兼容模型分段输出；
+    4. 如果完全没有 Markdown，但文本看起来像代码，则兜底返回原文。
     """
-    # 1. 移除 <think> 标签 (以防万一模型输出了思维链)
+    # 先移除潜在的 `<think>` 包裹内容，避免推理模型把思维链混进代码区。
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    # 2. 正则匹配：匹配 ```python 或 ``` 开头，直到下一个 ``` 结束
-    # re.DOTALL 让 . 能匹配换行符
-    # (?:python|py)? 表示可选的语言标识
+    # 正则匹配 Markdown 代码块。这里允许语言标识缺省，因为很多模型会省略 `python`。
     pattern = r"```(?:\s*python|\s*py)?\n(.*?)```"  
     matches = re.findall(pattern, text, re.DOTALL)
     if matches:
-        # 找到了代码块
-        # strip() 去除首尾空白
         code_blocks = [m.strip() for m in matches]
-        # 将多个代码块用换行拼接（应对模型分段写代码的情况）
+        # 多块拼接的原因是：有些模型会先给 import，再补主体函数，最后补 main。
         full_code = "\n\n".join(code_blocks)
         return full_code    
     else:
-        # 没找到代码块的 fallback 策略
-        # 检查是否包含常见的 Python 关键字，如果包含，可能整个回复就是代码
+        # fallback：如果看起来明显是裸代码，就直接返回，尽量不让一次生成机会浪费掉。
         keywords = ["def ", "import ", "class ", "print("]
         if any(k in text for k in keywords):
             print("⚠️ Warning: No markdown detected, assuming raw text is code.")
