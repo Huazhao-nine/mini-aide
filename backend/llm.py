@@ -21,7 +21,7 @@ from openai import OpenAI
 # ==========================================
 # 配置 DeepSeek API
 # ==========================================
-API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-d66b659120d04f3eb60b79cd88b7b62a").strip()
+API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
 MODEL_NAME = os.getenv("DEEPSEEK_MODEL", "deepseek-reasoner").strip()
 _CLIENT = None
