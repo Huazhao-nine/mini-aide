@@ -1,7 +1,17 @@
-from config import WORKSPACE_DIR, timeout
+"""
+历史 prompt 封装器。
+
+这个文件保留了一个更早期的 prompt 组织方式：把 draft / improve / debug / review 的规则
+包装成字典结构。当前主流程已经直接在 `core/agent.py` 中构造实际生效的 prompt，所以这里
+更像历史/备用实现，而不是搜索主循环正在调用的路径。
+"""
+
+from utils.config import WORKSPACE_DIR, timeout
 
 
 class AgentPrompt:
+    """早期版本的 prompt 组装器，当前未接主流程。"""
+
     def __init__(self, task_desc):
         self.task_desc = task_desc
         self.timeout = timeout
@@ -9,6 +19,7 @@ class AgentPrompt:
 
     @property
     def _resp_fmt(self):
+        # 先解释、再输出单一代码块，是为了让上层既能保存 thought，也能稳定提取 code。
         return {
             "回复格式": [
                 "先写 3-5 句简短方案说明。",
@@ -19,6 +30,7 @@ class AgentPrompt:
 
     @property
     def _protocol(self):
+        # 输出协议是 evaluator 能否稳定解析 FINAL_SCORE 的前提。
         return {
             "输出协议": [
                 "脚本最后必须打印：FINAL_SCORE=<数值>。",
@@ -29,6 +41,7 @@ class AgentPrompt:
 
     @property
     def _env(self):
+        # 环境说明相当于对 coding operator 的外部边界约束。
         return {
             "运行环境": [
                 "你输出的是单文件 Python 脚本，本地直接执行。",
@@ -40,6 +53,7 @@ class AgentPrompt:
 
     @property
     def _general_rules(self):
+        # 通用约束强调：保留有效父方案、避免泄漏、一次只动一个主因素。
         return {
             "通用约束": [
                 "优先保留父方案已验证有效的部分。",
@@ -59,6 +73,7 @@ class AgentPrompt:
         return base
 
     def get_draft_prompt(self, history, data_preview=None, force_new_family: bool = False):
+        # 语义上对应论文里的 drafting 入口，只是当前版本没有接入主循环。
         draft_rules = [
             "先写出稳定、可运行、评估逻辑正确的 baseline。",
             "若任务描述明确要求 DNN/MLP 主线，则优先使用 PyTorch MLP，而不是树模型。",
@@ -80,6 +95,7 @@ class AgentPrompt:
         return prompt
 
     def get_improve_prompt(self, journal_summary, parent_node_code, change_type="feature"):
+        # 语义上对应 improving 入口，通过 change_type 约束“原子改动”的范围。
         hard_templates = {
             "feature": [
                 "只允许改特征处理或输入表示；不要改模型家族、CV 主干、训练主干。",
@@ -130,6 +146,7 @@ class AgentPrompt:
         return prompt
 
     def get_debug_prompt(self, parent_node_code, term_out, data_preview=None):
+        # 语义上对应 debugging 入口，重点是最小修复而不是重写方案。
         prompt = {
             "系统消息": "你之前的代码运行失败了。请做最小限度修复，优先恢复可运行性、评分协议与已有有效逻辑。",
             "任务描述": self.task_desc,
@@ -147,6 +164,7 @@ class AgentPrompt:
         return prompt
 
     def get_review_prompt(self, code, term_out):
+        # 这里体现的是“执行后摘要”思路，与当前主流程中的 review 目标一致。
         return {
             "系统消息": "请基于执行输出做极简评审。系统会程序解析 FINAL_SCORE，你只需要给一句到四句的有效总结。",
             "任务描述": self.task_desc,

@@ -4,6 +4,9 @@
 论文中的 objective function h(s) 可以是 accuracy、AUC、MSE 等任意标量，而且有的指标
 越大越好，有的越小越好。为了让 `Journal.get_best_node()` 不关心具体指标方向，这里把
 “比较大小”抽象成“谁更优”。
+
+这个文件虽然很小，却解决了论文复现里的关键工程问题：不同任务的 objective function
+方向不同，但 solution tree 仍然需要统一比较谁是当前最佳节点。
 """
 
 from dataclasses import dataclass
@@ -19,6 +22,8 @@ class MetricValue:
 
     关键点在于 `>` 的语义被重定义为“更优于”，而不是“数值更大”。
     例如在 MSE 任务里，0.81 > 0.89 会返回 True，因为 0.81 更好。
+
+    这样 `Journal.get_best_node()` 就不必知道当前任务到底是 maximize 还是 minimize。
     """
 
     value: Optional[float]

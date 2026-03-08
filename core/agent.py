@@ -10,6 +10,10 @@
 
 这个版本做了工程上的简化，但整体闭环仍然与论文一致：先生成候选代码，再运行评估，
 把结果写回树结构，然后基于树中已有节点继续 draft / debug / improve。
+
+如果复试老师追问“哪一份代码最能体现你复现了论文核心思想”，这通常就是答案。因为这里把
+论文里的 solution tree、search policy、summarization operator、coding operator 和
+evaluator 全部串成了一个可运行闭环。
 """
 
 import json
@@ -26,7 +30,7 @@ from core.interpreter import Interpreter, ExecutionResult
 from core.journal import Journal, Node
 from core.metric import MetricValue, WorstMetricValue
 from utils.utils import extract_python_code
-from config import (
+from utils.config import (
     WORKSPACE_DIR,
     num_drafts,
     debug_prob,
@@ -91,18 +95,23 @@ class Agent:
     2. 调用 LLM 生成新的单文件 Python 方案；
     3. 运行方案并抽取 metric / 协议错误；
     4. 把结果追加到树中，形成论文里的 trial-and-error 搜索过程。
+
+    因此可以把 `Agent` 直接理解为论文 Algorithm 1 的工程控制器。
     """
 
     def __init__(
         self,
         task_prompt: str,
         workdir: str,
+        submission_relpath: str = "submission.csv",
         interpreter_factory: Optional[Callable[[str, int], Interpreter]] = None,
         journal: Optional[Journal] = None,
     ):
         # 任务描述会被复用到所有 prompt 中，相当于论文里固定不变的 task context。
         self.task_prompt = task_prompt
         self.workdir = workdir
+        self.submission_relpath = str(submission_relpath).strip().lstrip("./") or "submission.csv"
+        self.submission_path = os.path.join(self.workdir, self.submission_relpath)
         self.num_drafts = int(num_drafts)
         self.debug_prob = float(debug_prob)
         self.max_debug_depth = int(max_debug_depth)
@@ -123,8 +132,9 @@ class Agent:
             if interpreter_factory
             else Interpreter(workdir=workdir, timeout=self.timeout)
         )
-        self.solution_dir = os.path.join(self.workdir, "solutions")
+        self.solution_dir = os.path.join(self.workdir, "solution")
         os.makedirs(self.solution_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(self.submission_path), exist_ok=True)
 
     # -------------------- prompts --------------------
     def _infer_required_family(self, task_prompt: str) -> Optional[str]:
@@ -138,10 +148,54 @@ class Agent:
 
     def _system_prompt(self) -> str:
         # 所有 coding / review 调用共享的系统约束，确保 LLM 始终以“自动实验代理”身份工作。
+        # 它等价于给 coding operator 固定一个角色：不是通用聊天助手，而是 leaderboard 导向的 ML engineer。
         return (
-            "你是一个在自动实验循环里工作的 ML 工程师 Agent。\n"
-            "每次只做小步、可对比的改动；优先稳定 baseline，再逐步改进。\n"
-            "当被要求“评审执行结果”时，必须输出严格 JSON（不要输出任何多余文本）。\n"
+            "你是一个在自动实验循环里工作的 Kaggle leaderboard-oriented ML engineer。\n"
+            "你的目标不是写漂亮代码，而是在严格协议下产出可提交、可复现、对 leaderboard 有竞争力的单文件方案。\n"
+            "先保证 submission 路径/列名、CV 协议、FINAL_SCORE 最后一行、fold-safe preprocessing 都正确，再追求更复杂模型。\n"
+            "每一轮只做一个主要改动，避免把多个因素混在一起导致无法归因。\n"
+            "优先使用成熟竞赛模板和任务匹配的强模型家族，不要做无根据的大杂烩重构。\n"
+            "若父方案已经有效，默认保留其有效部分，只对一个瓶颈做原子级改进。\n"
+            "必须显式固定随机种子；若使用 early stopping 或 best checkpoint，必须恢复 best 权重后再做 OOF 和 test 预测。\n"
+            "不要把主逻辑包在 if __name__ == '__main__': 之下，因为当前执行环境是 exec 单文件脚本。\n"
+            "submission 路径必须写成对当前脚本位置稳健的形式：优先用 `script_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()`，再用 `os.path.join(script_dir, ...)` 构造，并在保存前 `os.makedirs(parent, exist_ok=True)`。\n"
+            "可使用 GPU；若使用 torch，请自动检测 cuda 并在不可用时安全回退到 cpu。\n"
+            "当前脚本运行在 Interpreter 子进程内，默认禁止 joblib/loky 多进程并行；sklearn、joblib、cross-validation、GridSearchCV 等相关 n_jobs 一律设为 1。\n"
+            "不要使用 n_jobs=-1、multiprocessing 多进程池或在脚本内部再启动并行子进程，除非任务 prompt 明确要求且无法避免。\n"
+            "当被要求评审执行结果时，必须输出严格 JSON，不要输出任何额外文本。\n"
+        )
+
+    def _family_hint_rules(self, family_hint: Optional[str]) -> str:
+        # 通过 prompt 软约束控制本轮优先探索的模型家族，而不改动树搜索框架本身。
+        if family_hint == "tree":
+            return (
+                "- 本轮模型家族提示：优先树模型/boosting 风格 baseline。\n"
+                "- 对表格任务，优先稳健的缺失值处理、类别编码、fold 内训练和 test fold 平均，而不是复杂神经网络。\n"
+            )
+        if family_hint == "linear":
+            return (
+                "- 本轮模型家族提示：优先线性/广义线性 baseline。\n"
+                "- 重点关注标准化、one-hot、稀疏特征、log1p 目标、概率校准或正则强度，而不是复杂集成。\n"
+            )
+        if family_hint == "nn":
+            return (
+                "- 本轮模型家族提示：优先神经网络 baseline。\n"
+                "- 若是图像任务，优先小而强的 CNN；若是表格任务，只有在任务 prompt 明确支持时才走 MLP 主线。\n"
+            )
+        return ""
+
+    def _shared_generation_checklist(self) -> str:
+        # 这是 draft / improve / debug 三类 prompt 共享的协议清单。
+        # 作用是把 submission 路径、FINAL_SCORE、fold-safe preprocessing 等高风险细节反复显式化。
+        return (
+            "- 写代码前先在心里确认：任务类型、指标方向、CV 协议、submission 路径、submission 列名、OOF 计算方式。\n"
+            f"- 如果有测试集，必须写出 `./{self.submission_relpath}`。\n"
+            "- 构造 submission 路径时，不要依赖调用命令时的当前工作目录；要基于脚本位置或 `os.getcwd()` 回退逻辑构造绝对路径，并在保存前创建父目录。\n"
+            "- 必须保证 FINAL_SCORE 是最后一个非空输出行。\n"
+            "- 所有 fit 类操作必须只在训练 fold 内进行；验证 fold 和测试集只能 transform / infer。\n"
+            "- 必须固定 random/numpy/torch seed，并尽量保证结果稳定可复现。\n"
+            "- 默认禁止 joblib/loky 多进程并行；sklearn 相关 `n_jobs` 统一设为 `1`。\n"
+            "- 若父方案已有效，优先保留已验证正确的特征、CV、submission 和 best-checkpoint 逻辑。\n"
         )
 
     def _draft_prompt(self, family_hint: Optional[str] = None) -> str:
@@ -151,20 +205,26 @@ class Agent:
         在 AIDE 中，draft 的目标不是一次性得到最终最优解，而是先构造若干“可运行的起点”
         作为树的根节点，为后续 improve 提供可继续优化的 parent。
         """
-        family_line = ""
-        if family_hint:
-            family_line = f"- 本轮 baseline 家族优先：`{family_hint}`（保持可运行和评估协议正确）\n"
+        family_line = self._family_hint_rules(family_hint)
         return textwrap.dedent(
             f"""
             {self.task_prompt}
 
             你现在处于【DRAFT】阶段（从零写 baseline）。
-            要求：
-            {family_line}- 生成一个完整、可直接运行的 Python 脚本
-            - 方案要稳健、不要花里胡哨
-            - 最后一行必须打印：`FINAL_SCORE=<number>`
-            - 如果有测试集，必须写出 `./submission.csv`（并可额外同步到 `./working/submission.csv`）
-            - 若使用 early stopping 保存最佳模型，必须使用 `copy.deepcopy(model.state_dict())` 保存并在预测前恢复
+            目标：
+            - 写出一个 leaderboard-oriented 的强单模型 baseline，重点是先把 local CV、submission 和协议做对。
+            - baseline 要尽量接近成熟 Kaggle kernel 风格，而不是教学级最小例子。
+
+            输出格式：
+            - 先写 2-4 句简短方案说明，明确你准备采用的模型主线和主要特征/训练策略。
+            - 然后只输出一个 ```python``` 代码块。
+
+            编码清单：
+            {family_line}{self._shared_generation_checklist()}- baseline 必须完整包含：数据读取、fold-safe 预处理、OOF 评估、test 推理、submission 导出。
+            - 默认先用当前任务最合理的强家族，不要一开始就做 stacking、大规模 HPO 或超重模型。
+            - 对表格任务，优先强而稳的 tabular baseline；对 Digit 这类图像任务，优先小型 CNN 主线。
+            - 若使用 early stopping 保存最佳模型，必须使用 `copy.deepcopy(model.state_dict())` 保存并在预测前恢复。
+            - 不要做冗长 EDA、交互式可视化、外部下载或多文件工程化拆分。
             """
         ).strip()
 
@@ -191,12 +251,24 @@ class Agent:
             记忆 / 历史经验（用于避免重复踩坑）：
             {mem}
 
-            要求：
-            - 只做一个“小改动”（原子级改进：一个想法/一个改动点）
-            - 必须可运行
-            - 最后一行必须打印：`FINAL_SCORE=<number>`
-            - 如果有测试集，必须写出 `./submission.csv`（并可额外同步到 `./working/submission.csv`）
-            - 若使用 early stopping 保存最佳模型，必须使用 `copy.deepcopy(model.state_dict())` 保存并在预测前恢复
+            目标：
+            - 基于当前有效父方案做一次能解释、能归因、对 leaderboard 常见有效的原子改进。
+            - 改进前提是保住现有正确的 OOF 和 submission 主干。
+
+            输出格式：
+            - 先写 2-4 句简短方案说明，明确“这轮只改什么、为什么值得、哪些部分保持不变”。
+            - 然后只输出一个 ```python``` 代码块。
+
+            原子改进约束：
+            - 本轮只允许改一个主要因素：特征、模型、训练、正则化、验证、submission 逻辑中的一个。
+            - 如果父方案已经能出有效分数，禁止重写整套 pipeline，除非历史明确说明当前主线系统性失效。
+            - 优先做 leaderboard 上常见有效的小步改动：稳健特征、模型容量、正则、scheduler、fold 聚合、轻量 TTA、概率质量。
+            - 不要同时改模型家族 + 特征工程 + 验证协议。
+
+            编码清单：
+            {self._shared_generation_checklist()}- 必须可运行，并保持父方案中已验证有效的 submission 路径、列名和 FINAL_SCORE 协议。
+            - 若使用 early stopping 保存最佳模型，必须使用 `copy.deepcopy(model.state_dict())` 保存并在预测前恢复。
+            - 不要复述或重复历史中已经证明无效的方向。
             """
         ).strip()
 
@@ -228,12 +300,24 @@ class Agent:
             记忆 / 历史经验：
             {mem}
 
-            要求：
-            - 最小改动修复问题
-            - 必须可运行
-            - 最后一行必须打印：`FINAL_SCORE=<number>`
-            - 如果有测试集，必须写出 `./submission.csv`（并可额外同步到 `./working/submission.csv`）
-            - 若使用 early stopping 保存最佳模型，必须使用 `copy.deepcopy(model.state_dict())` 保存并在预测前恢复
+            调试优先级（严格按顺序）：
+            1. 修 submission 路径、文件名、列名、排序和导出格式
+            2. 修 FINAL_SCORE 提取问题，确保它是最后一个非空输出行
+            3. 修 CV / OOF / fold-safe preprocessing / shape / dtype / 列对齐问题
+            4. 最后才修模型细节或训练细节
+
+            输出格式：
+            - 先写 2-4 句简短方案说明，明确“当前 bug 在哪里、这次最小修复是什么、哪些逻辑保持不动”。
+            - 然后只输出一个 ```python``` 代码块。
+
+            调试要求：
+            - 最小改动修复问题，不要趁机大改架构或顺手优化分数。
+            - 如果父方案已有正确的评估主干或特征主干，调试时必须保留。
+            - 若错误来自 submission、路径、列名、最后一行协议，优先只修这些问题。
+
+            编码清单：
+            {self._shared_generation_checklist()}- 必须可运行。
+            - 若使用 early stopping 保存最佳模型，必须使用 `copy.deepcopy(model.state_dict())` 保存并在预测前恢复。
             """
         ).strip()
 
@@ -351,6 +435,8 @@ class Agent:
         不同 action 使用不同 prompt 模板，但统一产出 `(thought, code)`：
         - thought: 记录这次修改的高层意图；
         - code: 可执行脚本本体，也就是 solution tree 中的节点内容。
+
+        这就是论文里抽象的 `f(s, Σ(T))` 在本项目中的直接工程实现。
         """
         if action == "draft":
             prompt = self._draft_prompt(family_hint=family_hint)
@@ -382,6 +468,7 @@ class Agent:
             logger.warning(f"LLM 代码提取失败，重试 {i + 1}/{int(retries)}")
 
         # fail-fast：避免空脚本被当成“执行成功但无指标”的噪声节点，污染树结构。
+        # 从 solution tree 视角看，空脚本几乎没有信息价值，只会浪费 debug/improve 预算。
         fallback_code = "raise RuntimeError('LLM returned empty/invalid code after retries')\n"
         fallback_thought = "LLM generation failed after retries."
         return fallback_thought, fallback_code
@@ -389,7 +476,9 @@ class Agent:
     # -------------------- execution + review --------------------
     def _cleanup_submission_files(self) -> None:
         # 每轮执行前清理旧 submission，避免把上一轮遗留文件误判为当前节点的有效输出。
+        # 这一步保证 evaluator 尽可能接近论文里的“无状态评价函数”假设。
         stale_paths = [
+            self.submission_path,
             os.path.join(self.workdir, "submission.csv"),
             os.path.join(self.workdir, "working", "submission.csv"),
         ]
@@ -407,6 +496,7 @@ class Agent:
 
     def _dump_solution_code(self, step_index: int, stage_name: str, node_id: str, code: str) -> str:
         # 为每个节点落盘快照，便于回溯 solution tree 的演化路径。
+        # 这些快照也是答辩时展示“搜索轨迹”的直接材料。
         filename = f"step{step_index}-{stage_name}-{node_id}.py"
         path = os.path.join(self.solution_dir, filename)
         try:
@@ -418,6 +508,7 @@ class Agent:
 
     def _save_best_code(self, best: Node) -> str:
         # 搜索结束后把当前全局最优节点单独保存，方便答辩时直接展示“最终版本”。
+        # 它不是论文伪代码里的必要部分，但对工程展示和 benchmark 产物管理很有帮助。
         path = os.path.join(self.workdir, "best.py")
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -427,22 +518,27 @@ class Agent:
         return path
 
     def _promote_submission_file(self) -> Optional[str]:
-        # 某些生成脚本会把提交文件写到 `working/submission.csv`，这里统一提升到 canonical 路径，
-        # 方便最终检查和人工查看。
-        nested = os.path.join(self.workdir, "working", "submission.csv")
-        canonical = os.path.join(self.workdir, "submission.csv")
+        # 允许把历史默认路径提升到当前任务要求的固定 submission 路径，方便兼容旧脚本。
+        # 这属于工程兼容层，而不是论文方法本身的核心逻辑。
+        candidates = [
+            self.submission_path,
+            os.path.join(self.workdir, "working", "submission.csv"),
+            os.path.join(self.workdir, "submission.csv"),
+        ]
+        src = next((p for p in candidates if os.path.exists(p)), None)
+        if src is None:
+            return None
 
-        if os.path.exists(nested):
-            try:
-                shutil.copy2(nested, canonical)
-                return canonical
-            except Exception as e:
-                logger.warning(f"同步最终 submission 失败: {nested} -> {canonical} | err={e}")
-                return None
+        if src == self.submission_path:
+            return src
 
-        if os.path.exists(canonical):
-            return canonical
-        return None
+        try:
+            os.makedirs(os.path.dirname(self.submission_path), exist_ok=True)
+            shutil.copy2(src, self.submission_path)
+            return self.submission_path
+        except Exception as e:
+            logger.warning(f"同步最终 submission 失败: {src} -> {self.submission_path} | err={e}")
+            return None
 
     def _programmatic_metric_extract(self, text: str) -> Optional[float]:
         # 论文里 h(s) 需要是一个标量目标值。这里通过约定的 `FINAL_SCORE=...` 从输出中提取。
@@ -468,13 +564,22 @@ class Agent:
 
     def _check_submission_file(self) -> list[str]:
         # 这属于“协议正确性”检查，不直接反映模型效果，但决定该节点是否可作为有效 solution。
-        candidates = [
+        # 在 Kaggle 场景下，分数有效不等于结果可提交，因此需要额外的 submission 合规检查。
+        legacy_candidates = [
             os.path.join(self.workdir, "submission.csv"),
             os.path.join(self.workdir, "working", "submission.csv"),
         ]
-        path = next((p for p in candidates if os.path.exists(p)), None)
-        if path is None:
-            return ["缺少提交文件：submission.csv 或 working/submission.csv"]
+        if os.path.exists(self.submission_path):
+            path = self.submission_path
+        else:
+            legacy = next((p for p in legacy_candidates if os.path.exists(p)), None)
+            if legacy is not None:
+                return [
+                    "提交文件路径不符合要求："
+                    f"应保存到 `{self.submission_relpath}`，"
+                    f"而不是 `{os.path.relpath(legacy, self.workdir)}`"
+                ]
+            return [f"缺少提交文件：{self.submission_relpath}"]
 
         try:
             import pandas as pd
@@ -489,15 +594,41 @@ class Agent:
         return []
 
     def _infer_submission_columns(self) -> list[str]:
-        # 当前项目已有多个任务入口，submission 列名不能继续写死成 COVID 回归格式。
+        # submission 列名优先从任务 prompt 的输出契约里解析，避免每新增一个任务都改白名单。
         prompt = self.task_prompt or ""
-        checks = [
+
+        block_match = re.search(
+            r"Submission columns must be:\s*((?:\n\s*-\s*`[^`]+`)+)",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+        if block_match:
+            cols = re.findall(r"`([^`]+)`", block_match.group(1))
+            if cols:
+                return cols
+
+        line_match = re.search(
+            r"列为[：:]\s*`([^`]+)`",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+        if line_match:
+            cols = [x.strip() for x in line_match.group(1).split(",") if x.strip()]
+            if cols:
+                return cols
+
+        fallback_checks = [
             (["PassengerId", "Survived"], ["PassengerId", "Survived"]),
+            (["PassengerId", "Transported"], ["PassengerId", "Transported"]),
             (["ImageId", "Label"], ["ImageId", "Label"]),
+            (["image_id", "label"], ["image_id", "label"]),
+            (["Id", "SalePrice"], ["Id", "SalePrice"]),
+            (["SalesID", "SalePrice"], ["SalesID", "SalePrice"]),
+            (["id", "label"], ["id", "label"]),
             (["id", "tested_positive_day3"], ["id", "tested_positive_day3"]),
         ]
         prompt_lower = prompt.lower()
-        for needles, columns in checks:
+        for needles, columns in fallback_checks:
             if all((f"`{x}`".lower() in prompt_lower) or (x.lower() in prompt_lower) for x in needles):
                 return columns
         return ["id", "tested_positive_day3"]
@@ -537,7 +668,7 @@ class Agent:
         elif not self._is_final_score_last_line(combined):
             hard_errors.append("FINAL_SCORE 不是最后一个非空输出行")
 
-        if "submission.csv" in self.task_prompt:
+        if self.submission_relpath:
             hard_errors.extend(self._check_submission_file())
         hard_errors.extend(self._static_code_checks(code))
 
@@ -554,10 +685,12 @@ class Agent:
         论文里的 Σ(T) 不只是保存标量分数，还会保存“这次改动做了什么、哪里出了问题、
         下一步该往哪改”的摘要。这里让模型输出结构化 JSON，再写入 `node.analysis`，
         供后续 improve / debug prompt 使用。
+
+        它承担的是“自然语言总结器”角色，而不是最终裁判；真正的硬门槛仍由程序化检查负责。
         """
         review_prompt = textwrap.dedent(
             f"""
-            你是一个 Kaggle 老手，正在评审一次代码执行结果。
+            你是一个 Kaggle 老手，正在评审一次 leaderboard-oriented 代码执行结果。
 
             你必须只输出【严格 JSON】（不要任何多余文字、不要 Markdown），并且必须包含以下 key：
             - is_bug (boolean)：是否认为这次运行“有问题”（崩溃/指标缺失/协议不合规/明显泄漏等）
@@ -567,8 +700,10 @@ class Agent:
 
             判断规则：
             - 如果运行崩溃、缺 FINAL_SCORE、submission 路径/列错误、明显泄漏、验证协议不对，都算 is_bug=true
+            - 优先检查 submission 契约、FINAL_SCORE 是否最后一行、OOF/CV 是否与任务一致
             - metric 应该与任务描述中的最终 score 定义一致（如果输出里有）
-            - summary 要“可执行”：能指导下一轮 debug/improve
+            - summary 要“可执行”：明确指出下一轮最值得修或最值得提升的单一主因素
+            - 如果本轮有效但看起来像 leaderboard 风险较高的本地刷分，也要在 summary 中指出风险来源
 
             【任务描述】：
             {task_desc}
@@ -596,6 +731,7 @@ class Agent:
 
     def _review_execution(self, code: str, result: ExecutionResult) -> Dict[str, Any]:
         # 最终评审以程序化检查为主、LLM 摘要为辅。前者负责“能不能进树”，后者负责“记住什么”。
+        # 可以把这里看成 evaluator 与 summarization operator 的衔接层。
         combined = (result.output or "").strip()
         prog = self._programmatic_review(code, result)
         llm = self._llm_review(self.task_prompt, code, combined)
@@ -667,6 +803,8 @@ class Agent:
         3. 执行评估；
         4. 写入 Journal；
         5. 打印当前树结构。
+
+        这就是论文 Algorithm 1 在本项目里的“一次完整循环”。
         """
         step_index = self.journal.num_nodes + 1
         policy = self.search_policy()
@@ -748,6 +886,8 @@ class Agent:
         - 保存 `best.py`
         - 再跑一次 best code，确保最终 submission 与最优节点一致
         - 打印最终树结构，方便人工复盘
+
+        这些额外步骤属于工程补强：方便 benchmark、复盘和答辩展示，不改变方法论本身。
         """
         for _ in range(int(max_steps)):
             self.step(self._execute)
@@ -779,7 +919,7 @@ class Agent:
             if promoted:
                 logger.info(f"最终可提交文件：{promoted}")
             else:
-                logger.warning("最终未找到 submission.csv，请检查最优代码输出路径。")
+                logger.warning(f"最终未找到 {self.submission_relpath}，请检查最优代码输出路径。")
         else:
             logger.info("⚠️ 最终没有找到有效（非 buggy）的节点。")
 

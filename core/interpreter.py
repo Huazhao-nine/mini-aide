@@ -6,6 +6,9 @@
 - 单独的子进程负责执行候选代码，隔离主进程；
 - stdout/stderr、异常、耗时都会被结构化收集；
 - 超时后会中断子进程，避免坏脚本卡死整个搜索。
+
+从论文映射角度看，这个文件最接近 evaluator `h(s)` 的执行壳：它不直接决定谁更优，
+只负责把候选代码真正运行起来，并把原始执行信号结构化返回。
 """
 
 import os
@@ -18,13 +21,15 @@ from dataclasses import dataclass
 from multiprocessing import Process, Queue
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import WORKSPACE_DIR
+from utils.config import WORKSPACE_DIR
 
 EOF_TOKEN = "<|EOF|>"
 
 
 @dataclass
 class ExecutionResult:
+    """执行器返回的结构化原始结果，可看作 evaluator 对单个候选解的观测。"""
+
     # Structured result fields：更接近论文里的 evaluator 输出。
     term_out: List[str]
     exec_time: float
@@ -79,6 +84,8 @@ class Interpreter:
 
     这里采用“持久子进程 + 多轮执行”的方式，而不是每次 `subprocess.run` 新开解释器。
     好处是协议统一、超时中断更明确，也更容易把输出流式写回主进程。
+
+    因而它是 evaluator 的工程实现，而不是树搜索策略本身。
     """
 
     def __init__(self, workdir: str = WORKSPACE_DIR, timeout: int = 60, exec_filename: str = "solution.py"):
@@ -120,6 +127,7 @@ class Interpreter:
 
     def _run_session(self, code_inq: Queue, result_outq: Queue, event_outq: Queue) -> None:
         # 子进程主循环：不断接收代码、写到临时文件、`exec` 执行，再回传状态事件。
+        # 这一步把“文本形式的候选解”真正转成“可执行实验”。
         self._child_proc_setup(result_outq)
         global_scope: Dict[str, Any] = {}
 

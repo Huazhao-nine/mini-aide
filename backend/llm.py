@@ -4,6 +4,14 @@
 上层 `Agent` 并不关心具体用的是 DeepSeek、OpenAI 还是别的模型，只要求提供一个
 `generate_response(messages)` 函数。这个文件负责把聊天消息发给后端模型，并把流式
 返回拼接成最终文本。
+
+从论文映射角度看，它不是 AIDE 的核心创新，而是 coding operator / review operator
+背后的“模型调用适配层”：
+- 论文里的 f(s, Σ(T)) 需要依赖 LLM 生成代码；
+- 结构化评审也需要依赖 LLM 生成摘要或 JSON；
+- 这个文件负责把这些上层需求转成具体 API 调用。
+
+复试时可以把它概括为：论文方法本身在 `core/`，而 `backend/` 只是把方法接到真实大模型上。
 """
 
 import sys
@@ -20,6 +28,12 @@ _CLIENT = None
 
 
 def _get_client():
+    """
+    延迟初始化远程模型客户端。
+
+    这里采用懒加载是纯工程取舍：避免模块导入时就触发网络请求或密钥错误。
+    对论文方法本身没有改变，但能让 AIDE 在“先构造 Agent，再按需调用模型”时更稳。
+    """
     global _CLIENT
     if _CLIENT is None:
         if not API_KEY:
@@ -39,6 +53,11 @@ def generate_response(messages, temperature=0):
     这些都交由 `Agent` 处理。这里仅负责把模型输出稳定拿回来。
 
     返回 `(full_content, full_reasoning)`，便于上层在需要时丢弃思维链、只保留正文。
+
+    从 AIDE 视角看，这个函数只负责“把模型输出拿回来”，不承担 search policy、
+    summarization 或 evaluation 的业务判断。这样的边界划分有两个好处：
+    1. 上层 `Agent` 可以保持与模型供应商解耦；
+    2. coding operator 和 review operator 的策略都留在 `core/agent.py` 中统一维护。
     """
     print(f"🤖 [AI] Connecting to DeepSeek API (Temp: {temperature})...\n")
     print("-" * 50) 

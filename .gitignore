@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Test / local cache
+.pytest_cache/
+
+# Experiment artifacts
+logs/
+workspace/
+working_*/
+
+# Local datasets and submissions
+input/
+submission-*.csv
+
+# OS/editor noise
+.DS_Store

@@ -5,6 +5,9 @@
  draft / debug / improve”。本文件就是这个树结构的本地实现：
 - `Node` 表示一个候选脚本及其运行结果；
 - `Journal` 负责追加节点、找最优节点、生成历史摘要、保存整棵树。
+
+如果 `core/agent.py` 是论文 Algorithm 1 的控制器，那么这个文件就是论文里 `T`
+（solution tree）的具体载体。复试时可以直接说：我把每轮代码、分数、错误和经验都保存成树节点。
 """
 
 import json
@@ -29,6 +32,12 @@ logger.propagate = False
 
 @dataclass
 class Node:
+    """
+    solution tree 中的单个节点。
+
+    它同时保存代码、执行结果和评审结果，因此既是论文里的“候选解”，也是工程上的完整实验记录。
+    """
+
     # 基本树结构信息：`parent/children` 共同定义了论文中的 solution tree。
     node_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     stage: str = "draft"
@@ -135,6 +144,8 @@ class Journal:
 
     它除了保存节点，还承担论文中 summarization operator 的一部分职责：把历史结果压缩成
     可放进 prompt 的文本记忆，避免把所有旧日志直接塞进上下文。
+
+    所以 `Journal` 在本项目里既是树容器，也是历史经验压缩器。
     """
     def __init__(self):
         self.nodes: List[Node] = []
@@ -206,6 +217,8 @@ class Journal:
 
         这就是论文中的 Σ(T) 的一个具体实现：不是把所有节点全量拼接，而是只保留若干表现最好的
         非 buggy 节点，浓缩它们的设计意图、结果和 metric。
+
+        这样做的目的是在有限上下文里保留真正有价值的历史信号。
         """
         goods = [n for n in self.good_nodes if n.success]
         goods = sorted(goods, key=lambda n: n.metric, reverse=True)[:max_items]
@@ -231,6 +244,8 @@ class Journal:
         由两部分组成：
         1. best-so-far：全局最优经验，帮助模型避免重复尝试已证伪方向；
         2. local trace：当前节点往上的局部祖先链，帮助模型理解这一分支最近做过什么。
+
+        可以把它理解成 Σ(T) 的“全局摘要 + 当前分支局部上下文”版本。
         """
         global_sum = self.generate_summary(include_code=False)
         if node is None:

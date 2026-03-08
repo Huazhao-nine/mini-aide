@@ -1,3 +1,14 @@
+"""
+`core.journal` 的回归测试。
+
+这组测试主要保护 solution tree 的几个核心语义：
+- 最优节点选择是否真的依赖 `MetricValue`；
+- debug 分支深度是否按树结构累计；
+- buggy 节点是否会被赋予最差指标。
+
+它们对应论文里的 `T`（solution tree）以及围绕树做搜索时的一些基本不变量。
+"""
+
 import unittest
 
 from core.journal import Journal, Node
@@ -5,6 +16,8 @@ from core.metric import MetricValue, WorstMetricValue
 
 
 class JournalTest(unittest.TestCase):
+    """保护 solution tree 的关键排序与结构语义。"""
+
     def test_get_best_node_uses_metric(self):
         journal = Journal()
 

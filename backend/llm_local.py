@@ -1,9 +1,29 @@
+"""
+本地 LLM 推理适配层。
+
+这个文件和 `backend/llm.py` 的职责相同，区别只是把远程 API 调用替换为本地模型推理。
+它同样不属于论文中的核心算法创新，而是把论文里的 coding/review operator 接到
+本地推理后端上的工程适配。
+
+保留这份实现的意义主要有两点：
+1. 方便在没有外部 API 或想离线演示时运行 mini-aide；
+2. 说明本项目的核心逻辑不依赖某一家模型服务，而是依赖“给定消息，返回文本”的接口。
+"""
+
 import re
 import sys
 from llama_cpp import Llama
-from config import MODEL_PATH
+from utils.config import MODEL_PATH
 _MODEL_INSTANCE = None
+
+
 def get_model():
+    """
+    懒加载本地模型实例。
+
+    这里把模型缓存为单例，是因为 AIDE 会在多轮搜索中频繁调用 LLM。若每轮都重新加载，
+    会把大量时间浪费在模型初始化，而不是论文真正关注的“代码空间搜索”上。
+    """
     global _MODEL_INSTANCE
     if _MODEL_INSTANCE is None:
         print(f"🚀 [System] Loading Local Model from: 【{MODEL_PATH} 】")
@@ -18,7 +38,10 @@ def get_model():
 
 def _extract_thought(raw_text):
     """
-    提取 <think>...</think> 内部的思维链
+    提取 `<think>...</think>` 内部的思维链。
+
+    这是对推理模型输出格式的兼容性处理。论文并不要求显式保留思维链，但工程上常常需要把
+    “最终可执行代码”和“模型中间推理文本”拆开，否则后续代码提取会被污染。
     """
     pattern = r"<think>(.*?)</think>"
     match = re.search(pattern, raw_text, re.DOTALL)
@@ -28,16 +51,18 @@ def _extract_thought(raw_text):
 
 def _clean_content(raw_text):
     """
-    去除 <think> 部分，只返回最终的代码/回答
+    去除 `<think>` 部分，只返回最终可执行正文。
     """
     cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL)
     return cleaned.strip()
 
 def generate_response(messages, temperature=0):
     """
-    通用生成接口 (Streaming 版)
-    :param messages: 标准 OpenAI 格式 [{"role": "user", "content": "..."}]
-    :return: (content_str, thought_str)
+    本地模型的统一生成接口（流式版）。
+
+    输入输出协议刻意对齐远程版 `backend/llm.py`，这样上层 `Agent` 无需区分当前到底是
+    远程 API 还是本地模型。这种“后端可替换、上层不感知”的设计，是论文方法能够稳定复现
+    的一个工程前提。
     """
     llm = get_model() 
     print(f"🤖 [AI] Generating response (Temperature: {temperature})...\n")
